@@ -9,3 +9,6 @@ Yet another messenger.
 - [ ] cluster coordination
 - [ ] TLS
 
+## LICENSE
+
+The [unlicense](https://github.com/andrew-suprun/envoy/blob/master/LICENSE).
