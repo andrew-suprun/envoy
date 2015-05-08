@@ -2,8 +2,8 @@ package main
 
 import (
 	"flag"
+	"github.com/andrew-suprun/envoy/messenger"
 	"log"
-	"messenger"
 	"os"
 )
 
