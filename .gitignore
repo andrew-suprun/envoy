@@ -3,5 +3,7 @@ pkg
 
 src/github.com/ugorji/
 
-src/apps/client/client
-src/apps/server/server
+apps/client/client
+apps/server/server
+
+github.com/
