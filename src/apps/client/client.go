@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"github.com/andrew-suprun/envoy/messenger"
 	"github.com/ugorji/go/codec"
 	"log"
+	"messenger"
 	"time"
 )
 

@@ -4,9 +4,8 @@ Yet another messenger.
 
 ## TODO
 
-[ ] multi-part messages
-
-[ ] cluster coordination
-
-[ ] TLS
+- [ ] basic functionality
+- [ ] multi-part messages
+- [ ] cluster coordination
+- [ ] TLS
 

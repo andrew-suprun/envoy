@@ -3,5 +3,5 @@ pkg
 
 src/github.com/ugorji/
 
-src/github.com/andrew-suprun/envoy/apps/client/client
-src/github.com/andrew-suprun/envoy/apps/server/server
+src/apps/client/client
+src/apps/server/server
