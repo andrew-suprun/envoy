@@ -13,8 +13,14 @@ import (
 	"time"
 )
 
+const DefaultTimeout = 30 * time.Second
+
 var TimeoutError = errors.New("timed out")
-var noSubscribersError = errors.New("no subscribers")
+var NoSubscribersError = errors.New("no subscribers")
+
+func Join(local string, remotes []string, options *Options) (Messenger, error) {
+	return join(local, remotes, options)
+}
 
 type Messenger interface {
 	// No more then one subscription per topic.
@@ -23,29 +29,14 @@ type Messenger interface {
 	Unsubscribe(topic string)
 
 	Publish(topic string, body []byte) ([]byte, error)
-	Broadcast(topic string, body []byte) []Result
+	Broadcast(topic string, body []byte) ([][]byte, error)
 
-	Join(remotes []string) error
+	Leave()
 }
 
 type Options struct {
 	Timeout *time.Duration
 	Retries *int
-}
-
-const DefaultTimeout = 30 * time.Second
-
-type Result struct {
-	Body  []byte
-	Error error
-}
-
-func NewMessenger(local string, options *Options) Messenger {
-	return &messenger{}
-}
-
-func (msgr *messenger) Join(remotes []string) error {
-	return msgr.join(remotes)
 }
 
 //
@@ -59,13 +50,18 @@ var c int64
 var ch codec.CborHandle
 
 type messenger struct {
-	local string
-	subscriptions
-	subscribers
-	hosts
-	pendingMessages
+	local           string
+	remotes         []string
+	subscriptions   map[string]func(string, []byte) []byte // key: topic
+	subscribers     map[string]map[string]*subscriber      // keys: topic/host
+	hosts           map[string]*host                       // key: host
+	pendingMessages map[messageId]*pendingMessage
 	*net.UDPConn
 	options
+	subscriptionsMutex   sync.Mutex
+	subscribersMutex     sync.Mutex
+	hostsMutex           sync.Mutex
+	pendingMessagesMutex sync.Mutex
 }
 
 type options struct {
@@ -73,30 +69,10 @@ type options struct {
 	retries int
 }
 
-type subscriptions struct {
-	subs map[string]func(string, []byte) []byte // key: topic
-	sync.Mutex
-}
-
-type subscribers struct {
-	subs map[string]map[string]*subscriber // keys: topic/host
-	sync.Mutex
-}
-
 type subscriber struct {
 }
 
-type hosts struct {
-	hosts map[string]host // key: host
-	sync.Mutex
-}
-
 type host struct {
-}
-
-type pendingMessages struct {
-	messages map[messageId]*pendingMessage
-	sync.Mutex
 }
 
 type pendingMessage struct {
@@ -129,22 +105,33 @@ func logError(err error) {
 
 ////// messenger
 
-func newMessenger(conn *net.UDPConn) *messenger {
-	return &messenger{
-		UDPConn:       conn,
-		subscriptions: subscriptions{subs: make(map[string]func(string, []byte) []byte)},
+func join(local string, remotes []string, options *Options) (Messenger, error) {
+	msgr := &messenger{
+		local:           local,
+		remotes:         remotes,
+		subscriptions:   make(map[string]func(string, []byte) []byte),
+		subscribers:     make(map[string]map[string]*subscriber),
+		hosts:           make(map[string]*host),
+		pendingMessages: make(map[messageId]*pendingMessage),
 	}
-}
+	if options != nil {
+		if options.Timeout != nil {
+			msgr.timeout = *options.Timeout
+		}
+		if options.Retries != nil {
+			msgr.retries = *options.Retries
+		}
+	}
 
-func (msgr *messenger) join(remotes []string) error {
+	msgr.remotes = remotes
 	laddr, err := net.ResolveUDPAddr("udp", msgr.local)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	conn, err := net.ListenUDP("udp", laddr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	log.Printf("    Listening on: %v", laddr)
 	buf := make([]byte, bufferSize)
@@ -167,30 +154,34 @@ func (msgr *messenger) join(remotes []string) error {
 			log.Printf("    Read %d bytes [%d] from host %s, port %d", n, count, addr.IP.String(), addr.Port)
 		}
 	}()
-	return nil
+	return msgr, nil
+}
+
+func (msgr *messenger) Leave() {
 }
 
 func (msgr *messenger) Subscribe(topic string, handler func(string, []byte) []byte) {
-	msgr.subscribe(topic, handler)
+	msgr.subscriptionsMutex.Lock()
+	msgr.subscriptions[topic] = handler
+	msgr.subscriptionsMutex.Unlock()
+
+	subscribeMsg := &message{}
+	_ = subscribeMsg
 }
 
 func (msgr *messenger) Unsubscribe(topic string) {
-	msgr.unsubscribe(topic)
+	// TODO: broadcast unsubscribe message
+	msgr.subscriptionsMutex.Lock()
+	delete(msgr.subscriptions, topic)
+	msgr.subscriptionsMutex.Unlock()
 }
 
 func (msgr *messenger) Publish(topic string, body []byte) ([]byte, error) {
-	msg := newMessage(topic, body)
-	hostName := msgr.selectHost(msg.Topic)
-	if hostName == "" {
-		return []byte{}, noSubscribersError
-	}
-
-	result := <-msgr.sendMessage(hostName, msg)
-	return result.Body, result.Error
+	return msgr.publish(topic, body, PostMessage)
 }
 
-func (msgr *messenger) Broadcast(topic string, body []byte) []Result {
-	return []Result{}
+func (msgr *messenger) Broadcast(topic string, body []byte) ([][]byte, error) {
+	return nil, nil
 }
 
 func (msgr *messenger) SetTimeout(timeout time.Duration) {
@@ -201,14 +192,39 @@ func (msgr *messenger) SetRetries(retries int) {
 	msgr.retries = retries
 }
 
-////// message
+func (msgr *messenger) selectHost(topic string) (hostName string) {
+	return ""
+}
 
-func newMessage(topic string, body []byte) *message {
-	return &message{
-		MessageId: newId(),
-		Topic:     topic,
-		BodyPart:  body,
+func (msgr *messenger) publish(topic string, body []byte, messageType int) ([]byte, error) {
+	msg := newMessage(topic, body, messageType)
+	hostName := msgr.selectHost(msg.Topic)
+	if hostName == "" {
+		return []byte{}, NoSubscribersError
 	}
+
+	resultChan := make(chan []byte)
+	timeoutChan := time.After(msgr.timeout)
+	msgr.sendMessage(hostName, msg, resultChan)
+	select {
+	case result := <-resultChan:
+		return result, nil
+	case <-timeoutChan:
+		return nil, TimeoutError
+	}
+}
+
+func newMessage(topic string, body []byte, messageType int) *message {
+	return &message{
+		MessageId:   newId(),
+		MessageType: messageType,
+		Topic:       topic,
+		BodyPart:    body,
+	}
+}
+
+func (msgr *messenger) sendMessage(hostName string, msg *message, resultChan chan []byte) {
+
 }
 
 func (msg *message) encode() []byte {
@@ -220,32 +236,6 @@ func (msg *message) encode() []byte {
 	}
 	return buf.Bytes()
 }
-
-////// subscriptions
-
-func (subs *subscriptions) subscribe(topic string, handler func(string, []byte) []byte) {
-	subs.Lock()
-	subs.subs[topic] = handler
-	subs.Unlock()
-}
-
-func (subs *subscriptions) unsubscribe(topic string) {
-	subs.Lock()
-	delete(subs.subs, topic)
-	subs.Unlock()
-}
-
-func (subs *subscriptions) selectHost(topic string) string {
-	return ""
-}
-
-////// hosts
-
-func (h *hosts) sendMessage(host string, msg *message) chan Result {
-	return nil
-}
-
-////// misc
 
 func parseBuffer(buf []byte) *message {
 	msg := &message{}
