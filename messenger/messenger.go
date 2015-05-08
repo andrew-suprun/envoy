@@ -13,10 +13,6 @@ import (
 	"time"
 )
 
-// TODO: multi-part messages
-// TODO: cluster coordination
-// TODO: TLS
-
 var Timeout = errors.New("timed out")
 
 func Join(local string, remotes []string) (Messenger, error) {
@@ -156,6 +152,8 @@ func join(local string, remotes []string) (Messenger, error) {
 	return newMessenger(conn), nil
 }
 
+////// messenger
+
 func newMessenger(conn *net.UDPConn) *messenger {
 	return &messenger{
 		UDPConn:       conn,
@@ -199,7 +197,7 @@ func (msgr *messenger) SetRetries(retries int) {
 	msgr.retries = retries
 }
 
-//////
+////// subscriptions
 
 func (subs *subscriptions) subscribe(topic string, handler func(Message)) {
 	subs.Lock()
@@ -217,12 +215,12 @@ func (subs *subscriptions) selectHost(topic string) string {
 	return ""
 }
 
-//////
+////// hosts
 
 func (h *hosts) sendMessage(host string, msg []byte) {
 }
 
-//////
+////// misc
 
 func parseBuffer(buf []byte) *message {
 	msg := &message{}
@@ -232,8 +230,7 @@ func parseBuffer(buf []byte) *message {
 	return msg
 }
 
-func newId() [16]byte {
-	var buf [16]byte
+func newId() (buf [16]byte) {
 	rand.Read(buf[:])
-	return buf
+	return
 }

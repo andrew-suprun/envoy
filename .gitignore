@@ -1,9 +1,5 @@
 bin
 pkg
 
-src/github.com/ugorji/
-
 apps/client/client
 apps/server/server
-
-github.com/
