@@ -4,18 +4,19 @@ import (
 	"flag"
 	"fmt"
 	"github.com/andrew-suprun/envoy/messenger"
+	"log"
 )
 
 var localAddrFlag = flag.String("local", "127.0.0.1:55555", "Local address to bind to.")
-var remoteAddrFlag = flag.String("remote", ":55556", "Remote address to join cluster.")
 
 func main() {
 	flag.Parse()
-	msgr, err := messenger.Join(*localAddrFlag, []string{*remoteAddrFlag}, nil)
+	msgr := messenger.NewMessenger()
+	msgr.Subscribe("job", handler)
 	if err != nil {
 		panic(err)
 	}
-	msgr.Subscribe("topic", handler)
+	err := msgr.Join(*localAddrFlag, []string{})
 	if err != nil {
 		panic(err)
 	}
@@ -25,4 +26,10 @@ func main() {
 func handler(topic string, body []byte) []byte {
 	fmt.Printf("~~~ got %s: %s\n", topic, string(body))
 	return body
+}
+
+func logError(err error) {
+	if err != nil {
+		log.Printf("### Error[%T]: %v", err, err)
+	}
 }

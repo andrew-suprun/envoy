@@ -3,3 +3,5 @@ pkg
 
 apps/client/client
 apps/server/server
+apps/test
+scratch.md
