@@ -12,11 +12,11 @@ var localAddrFlag = flag.String("local", "127.0.0.1:55555", "Local address to bi
 func main() {
 	flag.Parse()
 	msgr := messenger.NewMessenger()
-	msgr.Subscribe("job", handler)
+	err := msgr.Subscribe("job", handler)
 	if err != nil {
 		panic(err)
 	}
-	err := msgr.Join(*localAddrFlag, []string{})
+	err = msgr.Join(*localAddrFlag, []string{})
 	if err != nil {
 		panic(err)
 	}

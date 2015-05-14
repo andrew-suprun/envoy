@@ -17,12 +17,18 @@ func main() {
 	flag.Parse()
 
 	msgr := messenger.NewMessenger()
+	msgr.Subscribe("client", handler)
 	err := msgr.Join("localhost:55556", []string{"localhost:55555"})
 	logError(err)
 
-	result, err := msgr.Publish("aaa", []byte("bbb"))
+	result, err := msgr.Publish("job", []byte("bbb"))
 	logError(err)
 	fmt.Printf("result = '%s'\n", string(result))
+}
+
+func handler(topic string, body []byte) []byte {
+	fmt.Printf("~~~ got %s: %s\n", topic, string(body))
+	return body
 }
 
 func logError(err error) {
