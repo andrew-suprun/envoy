@@ -16,7 +16,10 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	err = msgr.Join(*localAddrFlag, []string{})
+	joined, err := msgr.Join(*localAddrFlag, []string{})
+	if len(joined) > 0 {
+		fmt.Printf("~~~ joined %v\n", joined)
+	}
 	if err != nil {
 		panic(err)
 	}

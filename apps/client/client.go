@@ -18,7 +18,10 @@ func main() {
 
 	msgr := messenger.NewMessenger()
 	msgr.Subscribe("client", handler)
-	err := msgr.Join("localhost:55556", []string{"localhost:55555"})
+	joined, err := msgr.Join("localhost:55556", []string{"localhost:55555"})
+	if len(joined) > 0 {
+		fmt.Printf("~~~ joined %v\n", joined)
+	}
 	logError(err)
 
 	result, err := msgr.Publish("job", []byte("bbb"))

@@ -39,7 +39,7 @@ func NewMessenger() Messenger {
 }
 
 type Messenger interface {
-	Join(local string, remotes []string) error
+	Join(local string, remotes []string) (joined []string, err error)
 	Leave()
 
 	Publish(topic string, body []byte) ([]byte, error)
@@ -191,16 +191,16 @@ func newMessenger() Messenger {
 	}
 }
 
-func (msgr *messenger) Join(local string, remotes []string) (err error) {
+func (msgr *messenger) Join(local string, remotes []string) (joined []string, err error) {
 	msgr.UDPAddr, err = net.ResolveUDPAddr("udp", local)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	local = msgr.UDPAddr.String()
 
 	msgr.UDPConn, err = net.ListenUDP("udp", msgr.UDPAddr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	log.Printf("Listening on: %s", local)
 
@@ -257,6 +257,7 @@ func (msgr *messenger) Join(local string, remotes []string) (err error) {
 			decode(bytes.NewBuffer(result.body), reply)
 			from := result.from.String()
 			fmt.Printf("~~~ Join.03: received = %+v\n", reply)
+			joined = append(joined, from)
 
 			fromHost := newHost(reply.Peers)
 			withPeers(msgr, func(peers peers) {
@@ -285,13 +286,11 @@ func (msgr *messenger) Join(local string, remotes []string) (err error) {
 			})
 
 		case <-time.After(msgr.timeout):
-
+			return joined, TimeoutError
 		}
-		fmt.Printf("~~~ Join.08: toJoin = %v\n", toJoin)
 	}
 
-	fmt.Printf("~~~ Join.09: toJoin = %v\n", toJoin)
-	return nil
+	return
 }
 
 func readLoop(msgr *messenger) {
@@ -311,79 +310,20 @@ func readLoop(msgr *messenger) {
 		header := decodeHeader(buf)
 		body := buf.Bytes()
 		fmt.Printf("~~~ received header %+v; body:'%s'\n", header, string(body))
+		msg := &message{from: from, header: header, body: body}
 
 		switch header.MessageType {
 		case request:
+			handleRequest(msgr, msg)
 			continue
 		case reply:
+			handleReply(msgr, msg)
 			continue
 		case joinRequest:
-			fmt.Printf("~~~ received joinRequest\n")
-			reply := &joinReplyBody{
-				Topics: []string{},
-				Peers:  make(map[string]string),
-			}
-
-			withSubscriptions(msgr, func(subs subscriptions) {
-				for topic := range subs {
-					reply.Topics = append(reply.Topics, topic)
-				}
-			})
-
-			withPeers(msgr, func(peers peers) {
-				for peer, host := range peers {
-					reply.Peers[peer] = host.state
-				}
-			})
-
-			buf := &bytes.Buffer{}
-			encode(reply, buf)
-
-			err := sendMessage(msgr, "", buf.Bytes(), header.MessageId, joinReply, from, nil)
-			if err != nil {
-				msgr.Info("Failed to send join reply message to %s: %s", from, err.Error())
-				continue
-			}
-
-			buf = bytes.NewBuffer(body)
-			request := &joinRequestBody{}
-			decode(buf, request)
-
-			withSubscribers(msgr, func(subsrs subscribers) {
-				for _, topic := range request.Topics {
-					addSubscriber(msgr.Logger, subsrs, topic, from)
-				}
-			})
-
+			handleJoinRequest(msgr, msg)
 			continue
 		case joinReply:
-			fmt.Printf("~~~ readLoop.joinReply.01: from %s\n", from)
-			buf := bytes.NewBuffer(body)
-			reply := &joinReplyBody{}
-			decode(buf, reply)
-			fmt.Printf("~~~ readLoop.joinReply.02: reply %+v\n", reply)
-
-			var peer *host
-			withPeers(msgr, func(peers peers) {
-				peer = peers[from.String()]
-			})
-			fmt.Printf("~~~ readLoop.joinReply.03: peer.pendingReplies %+v\n", peer.pendingReplies)
-
-			pr, prFound := (*pendingReply)(nil), false
-			withPendingReplies(peer, func(pendingReplies pendingReplies) {
-				pr, prFound = pendingReplies[header.MessageId]
-			})
-
-			if prFound {
-				pr.resultChan <- &message{
-					from:   from,
-					header: header,
-					body:   body,
-				}
-			} else {
-				msgr.Info("There is no message waiting for joinReply from %s", from)
-			}
-
+			handleJoinReply(msgr, msg)
 			continue
 		default:
 			panic(fmt.Errorf("Read unknown message type %d", header.MessageType))
@@ -429,6 +369,79 @@ func readLoop(msgr *messenger) {
 	}
 }
 
+func handleRequest(msgr *messenger, msg *message) {
+	fmt.Printf("~~~ received request\n")
+}
+
+func handleReply(msgr *messenger, msg *message) {
+	fmt.Printf("~~~ received reply\n")
+}
+
+func handleJoinRequest(msgr *messenger, msg *message) {
+	fmt.Printf("~~~ received joinRequest\n")
+	reply := &joinReplyBody{
+		Topics: []string{},
+		Peers:  make(map[string]string),
+	}
+
+	withSubscriptions(msgr, func(subs subscriptions) {
+		for topic := range subs {
+			reply.Topics = append(reply.Topics, topic)
+		}
+	})
+
+	withPeers(msgr, func(peers peers) {
+		for peer, host := range peers {
+			reply.Peers[peer] = host.state
+		}
+	})
+
+	buf := &bytes.Buffer{}
+	encode(reply, buf)
+
+	err := sendMessage(msgr, "", buf.Bytes(), msg.header.MessageId, joinReply, msg.from, nil)
+	if err != nil {
+		msgr.Info("Failed to send join reply message to %s: %s", msg.from, err.Error())
+		return
+	}
+
+	buf = bytes.NewBuffer(msg.body)
+	request := &joinRequestBody{}
+	decode(buf, request)
+
+	withSubscribers(msgr, func(subsrs subscribers) {
+		for _, topic := range request.Topics {
+			addSubscriber(msgr.Logger, subsrs, topic, msg.from)
+		}
+	})
+
+}
+
+func handleJoinReply(msgr *messenger, msg *message) {
+	fmt.Printf("~~~ readLoop.joinReply.01: from %s\n", msg.from)
+	buf := bytes.NewBuffer(msg.body)
+	reply := &joinReplyBody{}
+	decode(buf, reply)
+	fmt.Printf("~~~ readLoop.joinReply.02: reply %+v\n", reply)
+
+	var peer *host
+	withPeers(msgr, func(peers peers) {
+		peer = peers[msg.from.String()]
+	})
+	fmt.Printf("~~~ readLoop.joinReply.03: peer.pendingReplies %+v\n", peer.pendingReplies)
+
+	pr, prFound := (*pendingReply)(nil), false
+	withPendingReplies(peer, func(pendingReplies pendingReplies) {
+		pr, prFound = pendingReplies[msg.header.MessageId]
+	})
+
+	if prFound {
+		pr.resultChan <- msg
+	} else {
+		msgr.Info("There is no message waiting for joinReply from %s", msg.from)
+	}
+}
+
 func addSubscriber(logger Logger, subsrs subscribers, topic string, addr *net.UDPAddr) {
 	peer := addr.String()
 	topicMap, ok := subsrs[topic]
@@ -442,11 +455,6 @@ func addSubscriber(logger Logger, subsrs subscribers, topic string, addr *net.UD
 
 func newSubscriber(addr *net.UDPAddr) *subscriber {
 	return &subscriber{addr: addr}
-}
-
-type options struct {
-	timeout time.Duration
-	retries int
 }
 
 func logError(err error) {
