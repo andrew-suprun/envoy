@@ -86,21 +86,43 @@ const (
 	bufferSize      = maxBodyPartSize + 8
 )
 
+type (
+	subscriptions  map[string]Handler
+	subscribers    map[string]map[string]*subscriber
+	peers          map[string]*host
+	pendingReplies map[messageId]*pendingReply
+)
+
 type messenger struct {
-	timeout       time.Duration
-	retries       int
-	local         *net.UDPAddr
-	remotes       map[string]*net.UDPAddr
-	conn          *net.UDPConn
-	subscriptions map[string]func(string, []byte) []byte // key: topic
-	subscribers   map[string]map[string]*subscriber      // keys: topic/host
-	peers         map[string]*host                       // key: host
-	logger        Logger
+	*net.UDPAddr
 	*net.UDPConn
-	options
+	Logger
+	subscriptions      // key: topic
+	subscribers        // keys: topic/host
+	peers              // key: host
+	timeout            time.Duration
+	retries            int
 	subscriptionsMutex sync.Mutex
 	subscribersMutex   sync.Mutex
 	peersMutex         sync.Mutex
+}
+
+func withSubscriptions(msgr *messenger, f func(subscriptions)) {
+	msgr.subscriptionsMutex.Lock()
+	defer msgr.subscriptionsMutex.Unlock()
+	f(msgr.subscriptions)
+}
+
+func withSubscribers(msgr *messenger, f func(subscribers)) {
+	msgr.subscribersMutex.Lock()
+	defer msgr.subscribersMutex.Unlock()
+	f(msgr.subscribers)
+}
+
+func withPeers(msgr *messenger, f func(peers)) {
+	msgr.peersMutex.Lock()
+	defer msgr.peersMutex.Unlock()
+	f(msgr.peers)
 }
 
 type header struct {
@@ -124,10 +146,16 @@ type host struct {
 	pendingRepliesMutex sync.Mutex
 }
 
+func withPendingReplies(host *host, f func(pendingReplies)) {
+	host.pendingRepliesMutex.Lock()
+	defer host.pendingRepliesMutex.Unlock()
+	f(host.pendingReplies)
+}
+
 func newHost(peers map[string]string) *host {
 	return &host{
 		peers:          peers,
-		pendingReplies: make(map[messageId]*pendingReply),
+		pendingReplies: make(pendingReplies),
 	}
 }
 
@@ -156,43 +184,40 @@ func newMessenger() Messenger {
 	return &messenger{
 		timeout:       DefaultTimeout,
 		retries:       DefaultRetries,
-		remotes:       make(map[string]*net.UDPAddr),
-		subscriptions: make(map[string]func(string, []byte) []byte),
-		subscribers:   make(map[string]map[string]*subscriber),
-		peers:         make(map[string]*host),
-		logger:        defaultLogger,
+		Logger:        defaultLogger,
+		subscriptions: make(subscriptions),
+		subscribers:   make(subscribers),
+		peers:         make(peers),
 	}
 }
 
 func (msgr *messenger) Join(local string, remotes []string) (err error) {
-	msgr.local, err = net.ResolveUDPAddr("udp", local)
+	msgr.UDPAddr, err = net.ResolveUDPAddr("udp", local)
 	if err != nil {
 		return err
 	}
-	local = msgr.local.String()
+	local = msgr.UDPAddr.String()
 
-	delete(msgr.remotes, msgr.local.String())
-
-	msgr.conn, err = net.ListenUDP("udp", msgr.local)
+	msgr.UDPConn, err = net.ListenUDP("udp", msgr.UDPAddr)
 	if err != nil {
 		return err
 	}
-	log.Printf("Listening on: %v", msgr.local)
+	log.Printf("Listening on: %s", local)
 
-	go msgr.readLoop()
+	go readLoop(msgr)
 
-	msgr.subscriptionsMutex.Lock()
-	subs := make([]string, 0, len(msgr.subscriptions))
-	for sub := range msgr.subscriptions {
-		subs = append(subs, sub)
-	}
-	msgr.subscriptionsMutex.Unlock()
+	topics := []string{}
+	withSubscriptions(msgr, func(subs subscriptions) {
+		for topic := range subs {
+			topics = append(topics, topic)
+		}
+	})
 
 	buf := &bytes.Buffer{}
-	codec.NewEncoder(buf, &ch).MustEncode(joinRequestBody{Topics: subs})
+	codec.NewEncoder(buf, &ch).MustEncode(joinRequestBody{Topics: topics})
 	joinMessageBody := buf.Bytes()
 
-	resultChan := make(chan *message, len(msgr.remotes))
+	resultChan := make(chan *message)
 	toJoin := make([]string, len(remotes))
 	copy(toJoin, remotes)
 	sentInvitations := make(map[string]struct{})
@@ -201,7 +226,7 @@ func (msgr *messenger) Join(local string, remotes []string) (err error) {
 		invitation := toJoin[len(toJoin)-1]
 		raddr, err := net.ResolveUDPAddr("udp", invitation)
 		if err != nil {
-			msgr.logger.Info("Failed to resolve address %s. Ignoring", invitation)
+			msgr.Info("Failed to resolve address %s. Ignoring", invitation)
 			continue
 		}
 		invitation = raddr.String()
@@ -209,23 +234,21 @@ func (msgr *messenger) Join(local string, remotes []string) (err error) {
 		toJoin = toJoin[:len(toJoin)-1]
 		sentInvitations[invitation] = struct{}{}
 
-		msgr.remotes[invitation] = raddr
-
 		requestId := newId()
-		pendingReplies := map[messageId]*pendingReply{
+		pendingReplies := pendingReplies{
 			requestId: &pendingReply{
 				resultChan: resultChan,
 			},
 		}
 
-		msgr.peersMutex.Lock()
-		msgr.peers[invitation] = &host{
-			state:          "unknown",
-			pendingReplies: pendingReplies,
-		}
-		msgr.peersMutex.Unlock()
+		withPeers(msgr, func(peers peers) {
+			peers[invitation] = &host{
+				state:          "unknown",
+				pendingReplies: pendingReplies,
+			}
+		})
 
-		msgr.sendMessage("", joinMessageBody, requestId, joinRequest, raddr, resultChan)
+		sendMessage(msgr, "", joinMessageBody, requestId, joinRequest, raddr, resultChan)
 		fmt.Printf("~~~ Join.02: sent message to = %s\n", invitation)
 
 		select {
@@ -235,10 +258,16 @@ func (msgr *messenger) Join(local string, remotes []string) (err error) {
 			from := result.from.String()
 			fmt.Printf("~~~ Join.03: received = %+v\n", reply)
 
-			msgr.peers[from] = newHost(reply.Peers)
+			fromHost := newHost(reply.Peers)
+			withPeers(msgr, func(peers peers) {
+				peers[from] = fromHost
+			})
 			for _, peer := range reply.Peers {
 				if peer != local {
-					_, alreadyPresent := msgr.peers[peer]
+					alreadyPresent := false
+					withPeers(msgr, func(peers peers) {
+						_, alreadyPresent = peers[peer]
+					})
 					if !alreadyPresent {
 						_, alreadySent := sentInvitations[peer]
 						if !alreadySent {
@@ -249,11 +278,11 @@ func (msgr *messenger) Join(local string, remotes []string) (err error) {
 				}
 			}
 
-			msgr.subscribersMutex.Lock()
-			for _, topic := range reply.Topics {
-				msgr.addSubscriber(topic, result.from)
-			}
-			msgr.subscribersMutex.Unlock()
+			withSubscribers(msgr, func(subsrs subscribers) {
+				for _, topic := range reply.Topics {
+					addSubscriber(msgr.Logger, subsrs, topic, result.from)
+				}
+			})
 
 		case <-time.After(msgr.timeout):
 
@@ -265,10 +294,10 @@ func (msgr *messenger) Join(local string, remotes []string) (err error) {
 	return nil
 }
 
-func (msgr *messenger) readLoop() {
+func readLoop(msgr *messenger) {
 	byteSlice := make([]byte, bufferSize)
 	for {
-		n, from, err := msgr.conn.ReadFromUDP(byteSlice) // TODO: Shutdown on closed connection
+		n, from, err := msgr.ReadFromUDP(byteSlice) // TODO: Shutdown on closed connection
 		if err != nil {
 			logError(err)
 			continue
@@ -295,24 +324,24 @@ func (msgr *messenger) readLoop() {
 				Peers:  make(map[string]string),
 			}
 
-			msgr.subscriptionsMutex.Lock()
-			for topic := range msgr.subscriptions {
-				reply.Topics = append(reply.Topics, topic)
-			}
-			msgr.subscriptionsMutex.Unlock()
+			withSubscriptions(msgr, func(subs subscriptions) {
+				for topic := range subs {
+					reply.Topics = append(reply.Topics, topic)
+				}
+			})
 
-			msgr.peersMutex.Lock()
-			for peer, host := range msgr.peers {
-				reply.Peers[peer] = host.state
-			}
-			msgr.peersMutex.Unlock()
+			withPeers(msgr, func(peers peers) {
+				for peer, host := range peers {
+					reply.Peers[peer] = host.state
+				}
+			})
 
 			buf := &bytes.Buffer{}
 			encode(reply, buf)
 
-			err := msgr.sendMessage("", buf.Bytes(), header.MessageId, joinReply, from, nil)
+			err := sendMessage(msgr, "", buf.Bytes(), header.MessageId, joinReply, from, nil)
 			if err != nil {
-				msgr.logger.Info("Failed to send join reply message to %s: %s", from, err.Error())
+				msgr.Info("Failed to send join reply message to %s: %s", from, err.Error())
 				continue
 			}
 
@@ -320,11 +349,11 @@ func (msgr *messenger) readLoop() {
 			request := &joinRequestBody{}
 			decode(buf, request)
 
-			msgr.subscribersMutex.Lock()
-			for _, topic := range request.Topics {
-				msgr.addSubscriber(topic, from)
-			}
-			msgr.subscribersMutex.Unlock()
+			withSubscribers(msgr, func(subsrs subscribers) {
+				for _, topic := range request.Topics {
+					addSubscriber(msgr.Logger, subsrs, topic, from)
+				}
+			})
 
 			continue
 		case joinReply:
@@ -334,14 +363,16 @@ func (msgr *messenger) readLoop() {
 			decode(buf, reply)
 			fmt.Printf("~~~ readLoop.joinReply.02: reply %+v\n", reply)
 
-			msgr.peersMutex.Lock()
-			peer := msgr.peers[from.String()]
-			msgr.peersMutex.Unlock()
+			var peer *host
+			withPeers(msgr, func(peers peers) {
+				peer = peers[from.String()]
+			})
 			fmt.Printf("~~~ readLoop.joinReply.03: peer.pendingReplies %+v\n", peer.pendingReplies)
 
-			peer.pendingRepliesMutex.Lock()
-			pr, prFound := peer.pendingReplies[header.MessageId]
-			peer.pendingRepliesMutex.Unlock()
+			pr, prFound := (*pendingReply)(nil), false
+			withPendingReplies(peer, func(pendingReplies pendingReplies) {
+				pr, prFound = pendingReplies[header.MessageId]
+			})
 
 			if prFound {
 				pr.resultChan <- &message{
@@ -350,7 +381,7 @@ func (msgr *messenger) readLoop() {
 					body:   body,
 				}
 			} else {
-				msgr.logger.Info("There is no message waiting for joinReply from %s", from)
+				msgr.Info("There is no message waiting for joinReply from %s", from)
 			}
 
 			continue
@@ -358,20 +389,22 @@ func (msgr *messenger) readLoop() {
 			panic(fmt.Errorf("Read unknown message type %d", header.MessageType))
 		}
 
-		msgr.peersMutex.Lock()
-		host, ok := msgr.peers[from.String()]
-		msgr.peersMutex.Unlock()
+		host, ok := (*host)(nil), false
+		withPeers(msgr, func(peers peers) {
+			host, ok = peers[from.String()]
+		})
 		if !ok {
 			logError(fmt.Errorf("Received message from unknown peer %s. Ignoring.", from.String()))
 			continue
 		}
 
-		host.pendingRepliesMutex.Lock()
-		pending, found := host.pendingReplies[header.MessageId]
-		if found {
-			delete(host.pendingReplies, header.MessageId)
-		}
-		host.pendingRepliesMutex.Unlock()
+		pending, found := (*pendingReply)(nil), false
+		withPendingReplies(host, func(pendingReplies pendingReplies) {
+			pending, found = pendingReplies[header.MessageId]
+			if found {
+				delete(pendingReplies, header.MessageId)
+			}
+		})
 
 		if found {
 			pending.resultChan <- &message{
@@ -382,9 +415,10 @@ func (msgr *messenger) readLoop() {
 			continue
 		}
 
-		msgr.subscriptionsMutex.Lock()
-		handler, found := msgr.subscriptions[header.Topic]
-		msgr.subscriptionsMutex.Unlock()
+		var handler Handler
+		withSubscriptions(msgr, func(subs subscriptions) {
+			handler, found = subs[header.Topic]
+		})
 
 		if found {
 			go handler(header.Topic, body)
@@ -395,15 +429,15 @@ func (msgr *messenger) readLoop() {
 	}
 }
 
-func (msgr *messenger) addSubscriber(topic string, addr *net.UDPAddr) {
+func addSubscriber(logger Logger, subsrs subscribers, topic string, addr *net.UDPAddr) {
 	peer := addr.String()
-	topicMap, ok := msgr.subscribers[topic]
+	topicMap, ok := subsrs[topic]
 	if !ok {
 		topicMap = make(map[string]*subscriber)
-		msgr.subscribers[topic] = topicMap
+		subsrs[topic] = topicMap
 	}
 	topicMap[peer] = newSubscriber(addr)
-	msgr.logger.Info("Added new subscriber %s/%s", peer, topic)
+	logger.Info("Added new subscriber %s/%s", peer, topic)
 }
 
 func newSubscriber(addr *net.UDPAddr) *subscriber {
@@ -427,29 +461,29 @@ func (msgr *messenger) Leave() {
 }
 
 func (msgr *messenger) Subscribe(topic string, handler Handler) error {
-	msgr.subscriptionsMutex.Lock()
-	msgr.subscriptions[topic] = handler
-	msgr.subscriptionsMutex.Unlock()
+	withSubscriptions(msgr, func(subs subscriptions) {
+		subs[topic] = handler
+	})
 
-	if msgr.conn != nil {
+	if msgr.UDPConn != nil {
 		// TODO: broadcast subscribe message
 	}
 	return nil
 }
 
 func (msgr *messenger) Unsubscribe(topic string) error {
-	msgr.subscriptionsMutex.Lock()
-	delete(msgr.subscriptions, topic)
-	msgr.subscriptionsMutex.Unlock()
+	withSubscriptions(msgr, func(subs subscriptions) {
+		delete(subs, topic)
+	})
 
-	if msgr.conn != nil {
+	if msgr.UDPConn != nil {
 		// TODO: broadcast unsubscribe message
 	}
 	return nil
 }
 
 func (msgr *messenger) Publish(topic string, body []byte) ([]byte, error) {
-	return msgr.publish(topic, body, request)
+	return publish(msgr, topic, body, request)
 }
 
 func (msgr *messenger) Broadcast(topic string, body []byte) ([][]byte, error) {
@@ -465,37 +499,39 @@ func (msgr *messenger) SetRetries(retries int) {
 }
 
 func (msgr *messenger) SetLogger(logger Logger) {
-	msgr.logger = logger
+	msgr.Logger = logger
 }
 
-func (msgr *messenger) selectHost(topic string) (host *net.UDPAddr) {
-	msgr.subscribersMutex.Lock()
-	defer msgr.subscribersMutex.Unlock()
-	topicSubsribers, found := msgr.subscribers[topic]
-	if !found {
-		return nil
-	}
-
-	i := mRand.Intn(len(topicSubsribers))
-	for _, subr := range topicSubsribers {
-		i--
-		if i < 0 {
-			return subr.addr
+func selectHost(msgr *messenger, topic string) (host *net.UDPAddr) {
+	withSubscribers(msgr, func(subsrs subscribers) {
+		topicSubsribers, found := subsrs[topic]
+		if !found {
+			return
 		}
-	}
 
-	return nil
+		i := mRand.Intn(len(topicSubsribers))
+		for _, subr := range topicSubsribers {
+			i--
+			if i < 0 {
+				host = subr.addr
+				return
+			}
+		}
+
+		return
+	})
+	return
 }
 
-func (msgr *messenger) publish(topic string, body []byte, msgType messageType) ([]byte, error) {
-	to := msgr.selectHost(topic)
+func publish(msgr *messenger, topic string, body []byte, msgType messageType) ([]byte, error) {
+	to := selectHost(msgr, topic)
 	if to == nil {
 		return []byte{}, NoSubscribersError
 	}
 
 	resultChan := make(chan *message)
 	timeoutChan := time.After(msgr.timeout)
-	msgr.sendMessage(topic, body, newId(), msgType, to, resultChan)
+	sendMessage(msgr, topic, body, newId(), msgType, to, resultChan)
 	select {
 	case result := <-resultChan:
 		return result.body, nil
@@ -512,7 +548,7 @@ func newHeader(topic string, msgType messageType) *header {
 	}
 }
 
-func (msgr *messenger) sendMessage(topic string, body []byte, msgId messageId, msgType messageType, to *net.UDPAddr, resultChan chan *message) error {
+func sendMessage(msgr *messenger, topic string, body []byte, msgId messageId, msgType messageType, to *net.UDPAddr, resultChan chan *message) error {
 	msgHeader := header{
 		Topic:       topic,
 		MessageId:   msgId,
@@ -526,7 +562,7 @@ func (msgr *messenger) sendMessage(topic string, body []byte, msgId messageId, m
 	buf.Write(body)
 
 	fmt.Printf("~~~ writing to %s %d bytes\n", to, buf.Len())
-	_, err := msgr.conn.WriteToUDP(buf.Bytes(), to)
+	_, err := msgr.WriteToUDP(buf.Bytes(), to)
 	return err
 }
 
