@@ -87,9 +87,9 @@ const (
 )
 
 type (
-	subscriptions  map[string]Handler
-	subscribers    map[string]map[string]*subscriber
-	peers          map[string]*host
+	subscriptions  map[string]Handler // key: topic
+	subscribers    map[string]peers   // keys: topic/host
+	peers          map[string]*host   // key: host
 	pendingReplies map[messageId]*pendingReply
 )
 
@@ -97,9 +97,9 @@ type messenger struct {
 	*net.UDPAddr
 	*net.UDPConn
 	Logger
-	subscriptions      // key: topic
-	subscribers        // keys: topic/host
-	peers              // key: host
+	subscriptions
+	subscribers
+	peers
 	timeout            time.Duration
 	retries            int
 	subscriptionsMutex sync.Mutex
@@ -135,11 +135,8 @@ type header struct {
 	LastPart    bool        `codec:"lp,omitempty"`
 }
 
-type subscriber struct {
-	addr *net.UDPAddr
-}
-
 type host struct {
+	*net.UDPAddr
 	state               string
 	peers               map[string]string
 	pendingReplies      map[messageId]*pendingReply
@@ -152,8 +149,9 @@ func withPendingReplies(host *host, f func(pendingReplies)) {
 	f(host.pendingReplies)
 }
 
-func newHost(peers map[string]string) *host {
+func newHost(addr *net.UDPAddr, peers map[string]string) *host {
 	return &host{
+		UDPAddr:        addr,
 		peers:          peers,
 		pendingReplies: make(pendingReplies),
 	}
@@ -248,7 +246,7 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 			}
 		})
 
-		sendMessage(msgr, "", joinMessageBody, requestId, joinRequest, raddr, resultChan)
+		sendMessage(msgr, "", joinMessageBody, requestId, joinRequest, raddr)
 		fmt.Printf("~~~ Join.02: sent message to = %s\n", invitation)
 
 		select {
@@ -259,7 +257,7 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 			fmt.Printf("~~~ Join.03: received = %+v\n", reply)
 			joined = append(joined, from)
 
-			fromHost := newHost(reply.Peers)
+			fromHost := newHost(nil, reply.Peers)
 			withPeers(msgr, func(peers peers) {
 				peers[from] = fromHost
 			})
@@ -341,7 +339,7 @@ func handleRequest(msgr *messenger, msg *message) {
 
 	go func() {
 		result := handler(msg.header.Topic, msg.body)
-		sendMessage(msgr, "", result, msg.header.MessageId, reply, msg.from, nil)
+		sendMessage(msgr, "", result, msg.header.MessageId, reply, msg.from)
 	}()
 }
 
@@ -392,7 +390,7 @@ func handleJoinRequest(msgr *messenger, msg *message) {
 	buf := &bytes.Buffer{}
 	encode(reply, buf)
 
-	err := sendMessage(msgr, "", buf.Bytes(), msg.header.MessageId, joinReply, msg.from, nil)
+	err := sendMessage(msgr, "", buf.Bytes(), msg.header.MessageId, joinReply, msg.from)
 	if err != nil {
 		msgr.Info("Failed to send join reply message to %s: %s", msg.from, err.Error())
 		return
@@ -439,15 +437,11 @@ func addSubscriber(logger Logger, subsrs subscribers, topic string, addr *net.UD
 	peer := addr.String()
 	topicMap, ok := subsrs[topic]
 	if !ok {
-		topicMap = make(map[string]*subscriber)
+		topicMap = make(map[string]*host)
 		subsrs[topic] = topicMap
 	}
-	topicMap[peer] = newSubscriber(addr)
+	topicMap[peer] = newHost(addr, nil)
 	logger.Info("Added new subscriber %s/%s", peer, topic)
-}
-
-func newSubscriber(addr *net.UDPAddr) *subscriber {
-	return &subscriber{addr: addr}
 }
 
 func logError(err error) {
@@ -484,7 +478,46 @@ func (msgr *messenger) Unsubscribe(topic string) error {
 }
 
 func (msgr *messenger) Publish(topic string, body []byte) ([]byte, error) {
-	return publish(msgr, topic, body, request)
+	to := selectHost(msgr, topic)
+	if to == nil {
+		return []byte{}, NoSubscribersError
+	}
+
+	resultChan := make(chan *message)
+	timeoutChan := time.After(msgr.timeout)
+	msgId := newId()
+
+	withPendingReplies(to, func(p pendingReplies) {
+		p[msgId] = &pendingReply{resultChan: resultChan}
+	})
+
+	sendMessage(msgr, topic, body, msgId, request, to.UDPAddr)
+	select {
+	case result := <-resultChan:
+		return result.body, nil
+	case <-timeoutChan:
+		return nil, TimeoutError
+	}
+}
+
+func selectHost(msgr *messenger, topic string) (host *host) {
+	withSubscribers(msgr, func(subsrs subscribers) {
+		topicSubsribers, found := subsrs[topic]
+		if !found {
+			return
+		}
+
+		i := mRand.Intn(len(topicSubsribers))
+		for _, subsr := range topicSubsribers {
+			i--
+			if i < 0 {
+				host = subsr
+				return
+			}
+		}
+		return
+	})
+	return host
 }
 
 func (msgr *messenger) Broadcast(topic string, body []byte) ([][]byte, error) {
@@ -503,44 +536,6 @@ func (msgr *messenger) SetLogger(logger Logger) {
 	msgr.Logger = logger
 }
 
-func selectHost(msgr *messenger, topic string) (host *net.UDPAddr) {
-	withSubscribers(msgr, func(subsrs subscribers) {
-		topicSubsribers, found := subsrs[topic]
-		if !found {
-			return
-		}
-
-		i := mRand.Intn(len(topicSubsribers))
-		for _, subr := range topicSubsribers {
-			i--
-			if i < 0 {
-				host = subr.addr
-				return
-			}
-		}
-
-		return
-	})
-	return
-}
-
-func publish(msgr *messenger, topic string, body []byte, msgType messageType) ([]byte, error) {
-	to := selectHost(msgr, topic)
-	if to == nil {
-		return []byte{}, NoSubscribersError
-	}
-
-	resultChan := make(chan *message)
-	timeoutChan := time.After(msgr.timeout)
-	sendMessage(msgr, topic, body, newId(), msgType, to, resultChan)
-	select {
-	case result := <-resultChan:
-		return result.body, nil
-	case <-timeoutChan:
-		return nil, TimeoutError
-	}
-}
-
 func newHeader(topic string, msgType messageType) *header {
 	return &header{
 		MessageId:   newId(),
@@ -549,7 +544,7 @@ func newHeader(topic string, msgType messageType) *header {
 	}
 }
 
-func sendMessage(msgr *messenger, topic string, body []byte, msgId messageId, msgType messageType, to *net.UDPAddr, resultChan chan *message) error {
+func sendMessage(msgr *messenger, topic string, body []byte, msgId messageId, msgType messageType, to *net.UDPAddr) error {
 	msgHeader := header{
 		Topic:       topic,
 		MessageId:   msgId,
