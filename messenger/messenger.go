@@ -315,66 +315,59 @@ func readLoop(msgr *messenger) {
 		switch header.MessageType {
 		case request:
 			handleRequest(msgr, msg)
-			continue
 		case reply:
 			handleReply(msgr, msg)
-			continue
 		case joinRequest:
 			handleJoinRequest(msgr, msg)
-			continue
 		case joinReply:
 			handleJoinReply(msgr, msg)
-			continue
 		default:
 			panic(fmt.Errorf("Read unknown message type %d", header.MessageType))
 		}
-
-		host, ok := (*host)(nil), false
-		withPeers(msgr, func(peers peers) {
-			host, ok = peers[from.String()]
-		})
-		if !ok {
-			logError(fmt.Errorf("Received message from unknown peer %s. Ignoring.", from.String()))
-			continue
-		}
-
-		pending, found := (*pendingReply)(nil), false
-		withPendingReplies(host, func(pendingReplies pendingReplies) {
-			pending, found = pendingReplies[header.MessageId]
-			if found {
-				delete(pendingReplies, header.MessageId)
-			}
-		})
-
-		if found {
-			pending.resultChan <- &message{
-				from:   from,
-				header: header,
-				body:   body,
-			}
-			continue
-		}
-
-		var handler Handler
-		withSubscriptions(msgr, func(subs subscriptions) {
-			handler, found = subs[header.Topic]
-		})
-
-		if found {
-			go handler(header.Topic, body)
-			continue
-		}
-
-		logError(fmt.Errorf("Unexpected message %s from %v", header.MessageId, from))
 	}
 }
 
 func handleRequest(msgr *messenger, msg *message) {
 	fmt.Printf("~~~ received request\n")
+	handler, found := Handler(nil), false
+	withSubscriptions(msgr, func(subs subscriptions) {
+		handler, found = subs[msg.header.Topic]
+	})
+
+	if !found {
+		msgr.Info("Received request for non-subscribed topic %s. Ignored.", msg.header.Topic)
+		return
+	}
+
+	go func() {
+		result := handler(msg.header.Topic, msg.body)
+		sendMessage(msgr, "", result, msg.header.MessageId, reply, msg.from, nil)
+	}()
 }
 
 func handleReply(msgr *messenger, msg *message) {
-	fmt.Printf("~~~ received reply\n")
+	fmt.Printf("~~~ handleReply.01: msg = %+v\n", msg)
+	host, ok := (*host)(nil), false
+	withPeers(msgr, func(peers peers) {
+		host, ok = peers[msg.from.String()]
+	})
+	fmt.Printf("~~~ handleReply.02: host = %+v; ok = %v\n", host, ok)
+	if !ok {
+		logError(fmt.Errorf("Received reply from unknown peer %s. Ignoring.", msg.from.String()))
+		return
+	}
+
+	pending, found := (*pendingReply)(nil), false
+	withPendingReplies(host, func(pendingReplies pendingReplies) {
+		pending, found = pendingReplies[msg.header.MessageId]
+		if found {
+			delete(pendingReplies, msg.header.MessageId)
+		}
+	})
+
+	if found {
+		pending.resultChan <- msg
+	}
 }
 
 func handleJoinRequest(msgr *messenger, msg *message) {
