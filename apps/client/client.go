@@ -45,7 +45,7 @@ func run(thread int) {
 		fmt.Printf("Failed to join. Exiting\n")
 		os.Exit(1)
 	}
-	for job := 1; job <= 200; job++ {
+	for job := 1; job <= 500; job++ {
 		out := fmt.Sprintf("--- job #%d from thread #%d ---", job, thread)
 		outBuf := []byte(out)
 		start := time.Now()

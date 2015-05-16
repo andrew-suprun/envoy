@@ -26,7 +26,7 @@ func main() {
 }
 
 func handler(topic string, body []byte) []byte {
-	time.Sleep(time.Duration(rand.Intn(100)+50) * time.Millisecond)
+	time.Sleep(time.Duration(rand.Intn(3000)+2000) * time.Microsecond)
 	result := append([]byte("Received "), body...)
 	fmt.Printf(">>> %s\n", string(result))
 	return result
