@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"github.com/andrew-suprun/envoy/messenger"
 	"log"
+	"math/rand"
+	"time"
 )
 
 var localAddrFlag = flag.String("local", "127.0.0.1:55555", "Local address to bind to.")
@@ -16,10 +18,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	joined, err := msgr.Join(*localAddrFlag, []string{})
-	if len(joined) > 0 {
-		fmt.Printf("~~~ joined %v\n", joined)
-	}
+	_, err = msgr.Join(*localAddrFlag, []string{})
 	if err != nil {
 		panic(err)
 	}
@@ -27,8 +26,10 @@ func main() {
 }
 
 func handler(topic string, body []byte) []byte {
-	fmt.Printf("~~~ got %s: %s\n", topic, string(body))
-	return append([]byte("Received "), body...)
+	time.Sleep(time.Duration(rand.Intn(100)+50) * time.Millisecond)
+	result := append([]byte("Received "), body...)
+	fmt.Printf(">>> %s\n", string(result))
+	return result
 }
 
 func logError(err error) {

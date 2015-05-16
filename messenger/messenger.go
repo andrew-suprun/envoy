@@ -220,11 +220,10 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 	copy(toJoin, remotes)
 	sentInvitations := make(map[string]struct{})
 	for len(toJoin) > 0 {
-		fmt.Printf("~~~ Join.01: toJoin = %v\n", toJoin)
 		invitation := toJoin[len(toJoin)-1]
 		raddr, err := net.ResolveUDPAddr("udp", invitation)
 		if err != nil {
-			msgr.Info("Failed to resolve address %s. Ignoring", invitation)
+			msgr.Info("Failed to resolve address %s (%v). Ignoring.", invitation, err)
 			continue
 		}
 		invitation = raddr.String()
@@ -247,14 +246,12 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 		})
 
 		sendMessage(msgr, "", joinMessageBody, requestId, joinRequest, raddr)
-		fmt.Printf("~~~ Join.02: sent message to = %s\n", invitation)
 
 		select {
 		case result := <-resultChan:
 			reply := &joinReplyBody{}
 			decode(bytes.NewBuffer(result.body), reply)
 			from := result.from.String()
-			fmt.Printf("~~~ Join.03: received = %+v\n", reply)
 			joined = append(joined, from)
 
 			fromHost := newHost(nil, reply.Peers)
@@ -271,7 +268,6 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 						_, alreadySent := sentInvitations[peer]
 						if !alreadySent {
 							toJoin = append(toJoin, peer)
-							fmt.Printf("~~~ Join.04: toJoin = %v\n", toJoin)
 						}
 					}
 				}
@@ -299,15 +295,15 @@ func readLoop(msgr *messenger) {
 			logError(err)
 			continue
 		}
-		fmt.Printf("~~~ received %d bytes from %s; len(byteSlice) = %d\n", n, from, len(byteSlice))
 		if n == 0 {
-			fmt.Printf("~~~ received empty msg\n")
 			continue
 		}
 		buf := bytes.NewBuffer(byteSlice[:n])
 		header := decodeHeader(buf)
-		body := buf.Bytes()
-		fmt.Printf("~~~ received header %+v; body:'%s'\n", header, string(body))
+		// body := buf.Bytes()
+		body := make([]byte, buf.Len())
+		copy(body, buf.Bytes())
+
 		msg := &message{from: from, header: header, body: body}
 
 		switch header.MessageType {
@@ -326,7 +322,6 @@ func readLoop(msgr *messenger) {
 }
 
 func handleRequest(msgr *messenger, msg *message) {
-	fmt.Printf("~~~ received request\n")
 	handler, found := Handler(nil), false
 	withSubscriptions(msgr, func(subs subscriptions) {
 		handler, found = subs[msg.header.Topic]
@@ -344,19 +339,15 @@ func handleRequest(msgr *messenger, msg *message) {
 }
 
 func handleReply(msgr *messenger, msg *message) {
-	fmt.Printf("~~~ handleReply.01: msg = %+v\n", msg)
 	host, ok := (*host)(nil), false
 	withSubscribers(msgr, func(subsrs subscribers) {
 		topicSubsribers, found := subsrs[msg.Topic]
-		fmt.Printf("~~~ handleReply.02: topicSubsribers = %+v; found = %v\n", topicSubsribers, found)
 		if !found {
 			return
 		}
 
 		host, ok = topicSubsribers[msg.from.String()]
 	})
-	fmt.Printf("~~~ handleReply.02: from = %+v\n", msg.from)
-	fmt.Printf("~~~ handleReply.02: host = %+v; ok = %v\n", host, ok)
 	if !ok {
 		logError(fmt.Errorf("Received reply from unknown peer %s. Ignoring.", msg.from.String()))
 		return
@@ -376,7 +367,6 @@ func handleReply(msgr *messenger, msg *message) {
 }
 
 func handleJoinRequest(msgr *messenger, msg *message) {
-	fmt.Printf("~~~ received joinRequest\n")
 	reply := &joinReplyBody{
 		Topics: []string{},
 		Peers:  make(map[string]string),
@@ -416,17 +406,14 @@ func handleJoinRequest(msgr *messenger, msg *message) {
 }
 
 func handleJoinReply(msgr *messenger, msg *message) {
-	fmt.Printf("~~~ readLoop.joinReply.01: from %s\n", msg.from)
 	buf := bytes.NewBuffer(msg.body)
 	reply := &joinReplyBody{}
 	decode(buf, reply)
-	fmt.Printf("~~~ readLoop.joinReply.02: reply %+v\n", reply)
 
 	var peer *host
 	withPeers(msgr, func(peers peers) {
 		peer = peers[msg.from.String()]
 	})
-	fmt.Printf("~~~ readLoop.joinReply.03: peer.pendingReplies %+v\n", peer.pendingReplies)
 
 	pr, prFound := (*pendingReply)(nil), false
 	withPendingReplies(peer, func(pendingReplies pendingReplies) {
@@ -497,8 +484,6 @@ func (msgr *messenger) Publish(topic string, body []byte) ([]byte, error) {
 	withPendingReplies(to, func(p pendingReplies) {
 		p[msgId] = &pendingReply{resultChan: resultChan}
 	})
-	fmt.Printf("~~~ Publish: to = %+v\n", to)
-	fmt.Printf("~~~ Publish: pendingReplies = %+v\n", to.pendingReplies)
 
 	sendMessage(msgr, topic, body, msgId, request, to.UDPAddr)
 	select {
@@ -565,7 +550,6 @@ func sendMessage(msgr *messenger, topic string, body []byte, msgId messageId, ms
 	enc.MustEncode(msgHeader)
 	buf.Write(body)
 
-	fmt.Printf("~~~ writing to %s %d bytes\n", to, buf.Len())
 	_, err := msgr.WriteToUDP(buf.Bytes(), to)
 	return err
 }
