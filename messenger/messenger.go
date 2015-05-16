@@ -339,16 +339,23 @@ func handleRequest(msgr *messenger, msg *message) {
 
 	go func() {
 		result := handler(msg.header.Topic, msg.body)
-		sendMessage(msgr, "", result, msg.header.MessageId, reply, msg.from)
+		sendMessage(msgr, msg.header.Topic, result, msg.header.MessageId, reply, msg.from)
 	}()
 }
 
 func handleReply(msgr *messenger, msg *message) {
 	fmt.Printf("~~~ handleReply.01: msg = %+v\n", msg)
 	host, ok := (*host)(nil), false
-	withPeers(msgr, func(peers peers) {
-		host, ok = peers[msg.from.String()]
+	withSubscribers(msgr, func(subsrs subscribers) {
+		topicSubsribers, found := subsrs[msg.Topic]
+		fmt.Printf("~~~ handleReply.02: topicSubsribers = %+v; found = %v\n", topicSubsribers, found)
+		if !found {
+			return
+		}
+
+		host, ok = topicSubsribers[msg.from.String()]
 	})
+	fmt.Printf("~~~ handleReply.02: from = %+v\n", msg.from)
 	fmt.Printf("~~~ handleReply.02: host = %+v; ok = %v\n", host, ok)
 	if !ok {
 		logError(fmt.Errorf("Received reply from unknown peer %s. Ignoring.", msg.from.String()))
@@ -490,6 +497,8 @@ func (msgr *messenger) Publish(topic string, body []byte) ([]byte, error) {
 	withPendingReplies(to, func(p pendingReplies) {
 		p[msgId] = &pendingReply{resultChan: resultChan}
 	})
+	fmt.Printf("~~~ Publish: to = %+v\n", to)
+	fmt.Printf("~~~ Publish: pendingReplies = %+v\n", to.pendingReplies)
 
 	sendMessage(msgr, topic, body, msgId, request, to.UDPAddr)
 	select {
@@ -515,7 +524,6 @@ func selectHost(msgr *messenger, topic string) (host *host) {
 				return
 			}
 		}
-		return
 	})
 	return host
 }

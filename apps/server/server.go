@@ -28,7 +28,7 @@ func main() {
 
 func handler(topic string, body []byte) []byte {
 	fmt.Printf("~~~ got %s: %s\n", topic, string(body))
-	return body
+	return append([]byte("Received "), body...)
 }
 
 func logError(err error) {
