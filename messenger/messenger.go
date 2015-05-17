@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	DefaultTimeout = 2 * time.Second
+	DefaultTimeout = 1 * time.Second
 	DefaultRetries = 0
 )
 

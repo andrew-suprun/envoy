@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"github.com/andrew-suprun/envoy/messenger"
 	"log"
+	"math/rand"
 	"strings"
+	"time"
 )
 
 var localAddrFlag = flag.String("local", "127.0.0.1:55555", "Local address to bind to.")
@@ -37,7 +39,7 @@ func main() {
 }
 
 func handler(topic string, body []byte) []byte {
-	// time.Sleep(time.Duration(rand.Intn(3000)+2000) * time.Microsecond)
+	time.Sleep(time.Duration(rand.Intn(30000)+20000) * time.Microsecond)
 	result := append([]byte("Received "), body...)
 	fmt.Printf(">>> %s\n", string(result))
 	return result
