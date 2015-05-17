@@ -11,11 +11,12 @@ import (
 	mRand "math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	DefaultTimeout = 30 * time.Second
+	DefaultTimeout = 2 * time.Second
 	DefaultRetries = 0
 )
 
@@ -63,10 +64,6 @@ type Handler func(topic string, body []byte) []byte
 
 const messageIdSize = 16
 
-type messageId [messageIdSize]byte
-
-type messageType int
-
 const (
 	pingRequest messageType = iota
 	pongReply
@@ -87,9 +84,12 @@ const (
 )
 
 type (
-	subscriptions  map[string]Handler // key: topic
-	subscribers    map[string]peers   // keys: topic/host
-	peers          map[string]*host   // key: host
+	topic          string
+	hostId         string
+	messageId      [messageIdSize]byte
+	messageType    int
+	handlers       map[topic]Handler
+	hosts          map[hostId]*host
 	pendingReplies map[messageId]*pendingReply
 )
 
@@ -98,31 +98,62 @@ type messenger struct {
 	*net.UDPConn
 	Logger
 	subscriptions
-	subscribers
 	peers
-	timeout            time.Duration
-	retries            int
-	subscriptionsMutex sync.Mutex
-	subscribersMutex   sync.Mutex
-	peersMutex         sync.Mutex
+	timeout time.Duration
+	retries int
 }
 
-func withSubscriptions(msgr *messenger, f func(subscriptions)) {
-	msgr.subscriptionsMutex.Lock()
-	defer msgr.subscriptionsMutex.Unlock()
-	f(msgr.subscriptions)
+type subscriptions struct {
+	sync.Mutex
+	handlers
 }
 
-func withSubscribers(msgr *messenger, f func(subscribers)) {
-	msgr.subscribersMutex.Lock()
-	defer msgr.subscribersMutex.Unlock()
-	f(msgr.subscribers)
+func withSubscriptions(msgr *messenger, f func(handlers)) {
+	msgr.subscriptions.Lock()
+	defer msgr.subscriptions.Unlock()
+	f(msgr.subscriptions.handlers)
 }
 
-func withPeers(msgr *messenger, f func(peers)) {
-	msgr.peersMutex.Lock()
-	defer msgr.peersMutex.Unlock()
-	f(msgr.peers)
+type peers struct {
+	sync.Mutex
+	hosts
+}
+
+func withPeers(msgr *messenger, f func(hosts)) {
+	msgr.peers.Mutex.Lock()
+	defer msgr.peers.Unlock()
+	f(msgr.peers.hosts)
+}
+
+type host struct {
+	sync.Mutex
+	*net.UDPAddr
+	state          string
+	peers          map[hostId]string
+	topics         map[topic]struct{}
+	pendingReplies map[messageId]*pendingReply
+}
+
+func newHost(addr *net.UDPAddr, peers map[hostId]string, topics map[topic]struct{}) *host {
+	return &host{
+		UDPAddr:        addr,
+		peers:          peers,
+		topics:         topics,
+		pendingReplies: make(pendingReplies),
+	}
+}
+
+func withHost(host *host, f func()) {
+	host.Lock()
+	defer host.Unlock()
+	f()
+}
+
+type message struct {
+	hostId
+	from *net.UDPAddr
+	*header
+	body []byte
 }
 
 type header struct {
@@ -135,47 +166,17 @@ type header struct {
 	LastPart    bool        `codec:"lp,omitempty"`
 }
 
-type host struct {
-	*net.UDPAddr
-	state               string
-	peers               map[string]string
-	pendingReplies      map[messageId]*pendingReply
-	pendingRepliesMutex sync.Mutex
-}
-
-func withPendingReplies(host *host, f func(pendingReplies)) {
-	host.pendingRepliesMutex.Lock()
-	defer host.pendingRepliesMutex.Unlock()
-	f(host.pendingReplies)
-}
-
-func newHost(addr *net.UDPAddr, peers map[string]string) *host {
-	return &host{
-		UDPAddr:        addr,
-		peers:          peers,
-		pendingReplies: make(pendingReplies),
-	}
-}
-
-type message struct {
-	from *net.UDPAddr
-	*header
-	body []byte
-}
-
 type pendingReply struct {
 	resultChan chan *message
 }
 
-////// message bodies
-
 type joinRequestBody struct {
-	Topics []string `codec:"subs,omitempty"`
+	Topics map[topic]struct{} `codec:"subs,omitempty"`
 }
 
 type joinReplyBody struct {
-	Topics []string          `codec:"subs,omitempty"`
-	Peers  map[string]string `codec:"hosts,omitempty"`
+	Topics map[topic]struct{} `codec:"subs,omitempty"`
+	Peers  map[hostId]string  `codec:"hosts,omitempty"`
 }
 
 func newMessenger() Messenger {
@@ -183,9 +184,8 @@ func newMessenger() Messenger {
 		timeout:       DefaultTimeout,
 		retries:       DefaultRetries,
 		Logger:        defaultLogger,
-		subscriptions: make(subscriptions),
-		subscribers:   make(subscribers),
-		peers:         make(peers),
+		subscriptions: subscriptions{handlers: make(handlers)},
+		peers:         peers{hosts: make(hosts)},
 	}
 }
 
@@ -194,7 +194,7 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 	if err != nil {
 		return nil, err
 	}
-	local = msgr.UDPAddr.String()
+	localHost := hostId(msgr.UDPAddr.String())
 
 	msgr.UDPConn, err = net.ListenUDP("udp", msgr.UDPAddr)
 	if err != nil {
@@ -204,10 +204,14 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 
 	go readLoop(msgr)
 
-	topics := []string{}
-	withSubscriptions(msgr, func(subs subscriptions) {
-		for topic := range subs {
-			topics = append(topics, topic)
+	if len(remotes) == 0 {
+		return
+	}
+
+	topics := map[topic]struct{}{}
+	withSubscriptions(msgr, func(h handlers) {
+		for topic := range h {
+			topics[topic] = struct{}{}
 		}
 	})
 
@@ -215,21 +219,86 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 	codec.NewEncoder(buf, &ch).MustEncode(joinRequestBody{Topics: topics})
 	joinMessageBody := buf.Bytes()
 
+	timeoutChan := time.After(msgr.timeout)
 	resultChan := make(chan *message)
-	toJoin := make([]string, len(remotes))
-	copy(toJoin, remotes)
-	sentInvitations := make(map[string]struct{})
-	for len(toJoin) > 0 {
-		invitation := toJoin[len(toJoin)-1]
-		raddr, err := net.ResolveUDPAddr("udp", invitation)
+	toJoinChan := make(chan hostId, len(remotes)+8)
+	sentInvitations := make(map[hostId]struct{})
+	var (
+		invitationMutex sync.Mutex
+		sent            int64
+		received        int64
+	)
+
+	for _, remote := range remotes {
+		toJoinChan <- hostId(remote)
+	}
+
+	atomic.AddInt64(&sent, int64(len(remotes)))
+
+	go func() {
+		for {
+			log.Printf("~~~ for")
+			select {
+			case result := <-resultChan:
+				log.Printf("~~~ result: %+v", result)
+				reply := &joinReplyBody{}
+				decode(bytes.NewBuffer(result.body), reply)
+				joined = append(joined, string(result.hostId))
+
+				fromHost := newHost(result.from, reply.Peers, reply.Topics)
+				withPeers(msgr, func(hosts hosts) {
+					hosts[result.hostId] = fromHost
+				})
+				msgr.Info("Joined %s", result.hostId)
+				for peer, state := range reply.Peers {
+					_ = state // TODO: Handle peer state
+					if peer != localHost {
+						alreadyPresent := false
+						withPeers(msgr, func(hosts hosts) {
+							_, alreadyPresent = hosts[peer]
+						})
+						if !alreadyPresent {
+							invitationMutex.Lock()
+							_, alreadySent := sentInvitations[peer]
+							invitationMutex.Unlock()
+
+							if !alreadySent {
+								log.Printf("~~~ Join: to join: %s", peer)
+								atomic.AddInt64(&sent, 1)
+								toJoinChan <- peer
+							}
+						}
+					}
+				}
+				s := atomic.LoadInt64(&sent)
+				r := atomic.AddInt64(&received, 1)
+				if s == r {
+					log.Printf("~~~ break")
+					close(toJoinChan)
+					return
+				}
+			case <-timeoutChan:
+				log.Printf("~~~ timeout")
+				err = TimeoutError
+				close(toJoinChan)
+				return
+			}
+		}
+	}()
+
+	for invitation := range toJoinChan {
+		log.Printf("~~~ invitation = %s", invitation)
+		log.Printf("~~~ toJoinChan = %d", len(toJoinChan))
+		raddr, err := net.ResolveUDPAddr("udp", string(invitation))
 		if err != nil {
 			msgr.Info("Failed to resolve address %s (%v). Ignoring.", invitation, err)
 			continue
 		}
-		invitation = raddr.String()
+		invitation = hostId(raddr.String())
 
-		toJoin = toJoin[:len(toJoin)-1]
-		sentInvitations[invitation] = struct{}{}
+		invitationMutex.Lock()
+		sentInvitations[hostId(invitation)] = struct{}{}
+		invitationMutex.Unlock()
 
 		requestId := newId()
 		pendingReplies := pendingReplies{
@@ -238,50 +307,16 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 			},
 		}
 
-		withPeers(msgr, func(peers peers) {
-			peers[invitation] = &host{
+		withPeers(msgr, func(hosts hosts) {
+			hosts[hostId(invitation)] = &host{
+				UDPAddr:        raddr,
 				state:          "unknown",
 				pendingReplies: pendingReplies,
 			}
 		})
 
+		log.Printf("~~~ inviting %s", invitation)
 		sendMessage(msgr, "", joinMessageBody, requestId, joinRequest, raddr)
-
-		select {
-		case result := <-resultChan:
-			reply := &joinReplyBody{}
-			decode(bytes.NewBuffer(result.body), reply)
-			from := result.from.String()
-			joined = append(joined, from)
-
-			fromHost := newHost(nil, reply.Peers)
-			withPeers(msgr, func(peers peers) {
-				peers[from] = fromHost
-			})
-			for _, peer := range reply.Peers {
-				if peer != local {
-					alreadyPresent := false
-					withPeers(msgr, func(peers peers) {
-						_, alreadyPresent = peers[peer]
-					})
-					if !alreadyPresent {
-						_, alreadySent := sentInvitations[peer]
-						if !alreadySent {
-							toJoin = append(toJoin, peer)
-						}
-					}
-				}
-			}
-
-			withSubscribers(msgr, func(subsrs subscribers) {
-				for _, topic := range reply.Topics {
-					addSubscriber(msgr.Logger, subsrs, topic, result.from)
-				}
-			})
-
-		case <-time.After(msgr.timeout):
-			return joined, TimeoutError
-		}
 	}
 
 	return
@@ -300,11 +335,10 @@ func readLoop(msgr *messenger) {
 		}
 		buf := bytes.NewBuffer(byteSlice[:n])
 		header := decodeHeader(buf)
-		// body := buf.Bytes()
 		body := make([]byte, buf.Len())
 		copy(body, buf.Bytes())
 
-		msg := &message{from: from, header: header, body: body}
+		msg := &message{hostId: hostId(from.String()), from: from, header: header, body: body}
 
 		switch header.MessageType {
 		case request:
@@ -323,8 +357,8 @@ func readLoop(msgr *messenger) {
 
 func handleRequest(msgr *messenger, msg *message) {
 	handler, found := Handler(nil), false
-	withSubscriptions(msgr, func(subs subscriptions) {
-		handler, found = subs[msg.header.Topic]
+	withSubscriptions(msgr, func(handlers handlers) {
+		handler, found = handlers[topic(msg.header.Topic)]
 	})
 
 	if !found {
@@ -340,24 +374,19 @@ func handleRequest(msgr *messenger, msg *message) {
 
 func handleReply(msgr *messenger, msg *message) {
 	host, ok := (*host)(nil), false
-	withSubscribers(msgr, func(subsrs subscribers) {
-		topicSubsribers, found := subsrs[msg.Topic]
-		if !found {
-			return
-		}
-
-		host, ok = topicSubsribers[msg.from.String()]
+	withPeers(msgr, func(hosts hosts) {
+		host, ok = hosts[msg.hostId]
 	})
 	if !ok {
-		logError(fmt.Errorf("Received reply from unknown peer %s. Ignoring.", msg.from.String()))
+		logError(fmt.Errorf("Received reply from unknown peer %s. Ignoring.", msg.hostId))
 		return
 	}
 
 	pending, found := (*pendingReply)(nil), false
-	withPendingReplies(host, func(pendingReplies pendingReplies) {
-		pending, found = pendingReplies[msg.header.MessageId]
+	withHost(host, func() {
+		pending, found = host.pendingReplies[msg.header.MessageId]
 		if found {
-			delete(pendingReplies, msg.header.MessageId)
+			delete(host.pendingReplies, msg.header.MessageId)
 		}
 	})
 
@@ -368,18 +397,18 @@ func handleReply(msgr *messenger, msg *message) {
 
 func handleJoinRequest(msgr *messenger, msg *message) {
 	reply := &joinReplyBody{
-		Topics: []string{},
-		Peers:  make(map[string]string),
+		Topics: map[topic]struct{}{},
+		Peers:  make(map[hostId]string),
 	}
 
-	withSubscriptions(msgr, func(subs subscriptions) {
-		for topic := range subs {
-			reply.Topics = append(reply.Topics, topic)
+	withSubscriptions(msgr, func(handlers handlers) {
+		for topic := range handlers {
+			reply.Topics[topic] = struct{}{}
 		}
 	})
 
-	withPeers(msgr, func(peers peers) {
-		for peer, host := range peers {
+	withPeers(msgr, func(hosts hosts) {
+		for peer, host := range hosts {
 			reply.Peers[peer] = host.state
 		}
 	})
@@ -397,12 +426,12 @@ func handleJoinRequest(msgr *messenger, msg *message) {
 	request := &joinRequestBody{}
 	decode(buf, request)
 
-	withSubscribers(msgr, func(subsrs subscribers) {
-		for _, topic := range request.Topics {
-			addSubscriber(msgr.Logger, subsrs, topic, msg.from)
-		}
-	})
+	host := newHost(msg.from, make(map[hostId]string), request.Topics)
 
+	withPeers(msgr, func(hosts hosts) {
+		hosts[hostId(msg.hostId)] = host
+	})
+	msgr.Info("Joined %s", msg.hostId)
 }
 
 func handleJoinReply(msgr *messenger, msg *message) {
@@ -411,13 +440,13 @@ func handleJoinReply(msgr *messenger, msg *message) {
 	decode(buf, reply)
 
 	var peer *host
-	withPeers(msgr, func(peers peers) {
-		peer = peers[msg.from.String()]
+	withPeers(msgr, func(hosts hosts) {
+		peer = hosts[hostId(msg.hostId)]
 	})
 
 	pr, prFound := (*pendingReply)(nil), false
-	withPendingReplies(peer, func(pendingReplies pendingReplies) {
-		pr, prFound = pendingReplies[msg.header.MessageId]
+	withHost(peer, func() {
+		pr, prFound = peer.pendingReplies[msg.header.MessageId]
 	})
 
 	if prFound {
@@ -427,16 +456,16 @@ func handleJoinReply(msgr *messenger, msg *message) {
 	}
 }
 
-func addSubscriber(logger Logger, subsrs subscribers, topic string, addr *net.UDPAddr) {
-	peer := addr.String()
-	topicMap, ok := subsrs[topic]
-	if !ok {
-		topicMap = make(map[string]*host)
-		subsrs[topic] = topicMap
-	}
-	topicMap[peer] = newHost(addr, nil)
-	logger.Info("Added new subscriber %s/%s", peer, topic)
-}
+// func addSubscriber(logger Logger, subsrs subscribers, topic string, addr *net.UDPAddr) {
+// 	peer := addr.String()
+// 	topicMap, ok := subsrs[topic]
+// 	if !ok {
+// 		topicMap = make(map[string]*host)
+// 		subsrs[topic] = topicMap
+// 	}
+// 	topicMap[peer] = newHost(addr, nil)
+// 	logger.Info("Added new subscriber %s/%s", peer, topic)
+// }
 
 func logError(err error) {
 	if err != nil {
@@ -444,14 +473,13 @@ func logError(err error) {
 	}
 }
 
-////// messenger
-
 func (msgr *messenger) Leave() {
+	// TODO
 }
 
-func (msgr *messenger) Subscribe(topic string, handler Handler) error {
-	withSubscriptions(msgr, func(subs subscriptions) {
-		subs[topic] = handler
+func (msgr *messenger) Subscribe(_topic string, handler Handler) error {
+	withSubscriptions(msgr, func(handlers handlers) {
+		handlers[topic(_topic)] = handler
 	})
 
 	if msgr.UDPConn != nil {
@@ -460,9 +488,9 @@ func (msgr *messenger) Subscribe(topic string, handler Handler) error {
 	return nil
 }
 
-func (msgr *messenger) Unsubscribe(topic string) error {
-	withSubscriptions(msgr, func(subs subscriptions) {
-		delete(subs, topic)
+func (msgr *messenger) Unsubscribe(_topic string) error {
+	withSubscriptions(msgr, func(handlers handlers) {
+		delete(handlers, topic(_topic))
 	})
 
 	if msgr.UDPConn != nil {
@@ -471,8 +499,8 @@ func (msgr *messenger) Unsubscribe(topic string) error {
 	return nil
 }
 
-func (msgr *messenger) Publish(topic string, body []byte) ([]byte, error) {
-	to := selectHost(msgr, topic)
+func (msgr *messenger) Publish(_topic string, body []byte) ([]byte, error) {
+	to := selectHost(msgr, topic(_topic))
 	if to == nil {
 		return []byte{}, NoSubscribersError
 	}
@@ -481,11 +509,11 @@ func (msgr *messenger) Publish(topic string, body []byte) ([]byte, error) {
 	timeoutChan := time.After(msgr.timeout)
 	msgId := newId()
 
-	withPendingReplies(to, func(p pendingReplies) {
-		p[msgId] = &pendingReply{resultChan: resultChan}
+	withHost(to, func() {
+		to.pendingReplies[msgId] = &pendingReply{resultChan: resultChan}
 	})
 
-	sendMessage(msgr, topic, body, msgId, request, to.UDPAddr)
+	sendMessage(msgr, _topic, body, msgId, request, to.UDPAddr)
 	select {
 	case result := <-resultChan:
 		return result.body, nil
@@ -494,23 +522,22 @@ func (msgr *messenger) Publish(topic string, body []byte) ([]byte, error) {
 	}
 }
 
-func selectHost(msgr *messenger, topic string) (host *host) {
-	withSubscribers(msgr, func(subsrs subscribers) {
-		topicSubsribers, found := subsrs[topic]
-		if !found {
+func selectHost(msgr *messenger, t topic) (peer *host) {
+	withPeers(msgr, func(hosts hosts) {
+		subscribers := ([]*host)(nil)
+		for _, host := range hosts {
+			if _, ok := host.topics[t]; ok {
+				subscribers = append(subscribers, host)
+			}
+		}
+		if len(subscribers) == 0 {
 			return
 		}
 
-		i := mRand.Intn(len(topicSubsribers))
-		for _, subsr := range topicSubsribers {
-			i--
-			if i < 0 {
-				host = subsr
-				return
-			}
-		}
+		peer = subscribers[mRand.Intn(len(subscribers))]
+		return
 	})
-	return host
+	return peer
 }
 
 func (msgr *messenger) Broadcast(topic string, body []byte) ([][]byte, error) {
@@ -607,4 +634,12 @@ func (mType messageType) String() string {
 	default:
 		panic(fmt.Errorf("Unknown messageType %d", mType))
 	}
+}
+
+func (msg *message) String() string {
+	return fmt.Sprintf("[message: from: %s; header: %s; body %s]", msg.from, msg.header, string(msg.body))
+}
+
+func (h *header) String() string {
+	return fmt.Sprintf("[header: messageId: '%s'; messageType '%s'; topic: '%s']", h.MessageId, h.MessageType, h.Topic)
 }
