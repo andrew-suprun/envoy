@@ -39,8 +39,13 @@ func run() {
 		}
 	}
 
-	wg.Add(10000)
-	for i := 1; i <= 10000; i++ {
+	// for i := 1; i <= 10; i++ {
+	// 	msgr.Publish("job", []byte(fmt.Sprintf("foo %d", i)))
+	// }
+	// os.Exit(0)
+
+	wg.Add(2000)
+	for i := 1; i <= 2000; i++ {
 		thread := i
 		go func(thread int) {
 			for job := 1; job <= 100; job++ {

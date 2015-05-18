@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	DefaultTimeout = 1 * time.Second
-	DefaultRetries = 0
+	DefaultNetworkTimeout = time.Second
+	DefaultPublishTimeout = 30 * time.Second
 )
 
 var (
@@ -51,8 +51,8 @@ type Messenger interface {
 	Subscribe(topic string, handler Handler) error
 	Unsubscribe(topic string) error
 
-	SetTimeout(timeout time.Duration)
-	SetRetries(retries int)
+	SetNetworkTimeout(timeout time.Duration)
+	SetPublishTimeout(timeout time.Duration)
 	SetLogger(logger Logger)
 }
 
@@ -68,6 +68,7 @@ const (
 	pingRequest messageType = iota
 	pongReply
 	request
+	ack
 	reply
 	joinRequest
 	joinReply
@@ -99,8 +100,8 @@ type messenger struct {
 	Logger
 	subscriptions
 	peers
-	timeout time.Duration
-	retries int
+	networkTimeout time.Duration
+	publishTimeout time.Duration
 }
 
 type subscriptions struct {
@@ -128,13 +129,13 @@ func withPeers(msgr *messenger, f func(hosts)) {
 type host struct {
 	sync.Mutex
 	*net.UDPAddr
-	state          string
-	peers          map[hostId]string
+	state
+	peers          map[hostId]state
 	topics         map[topic]struct{}
 	pendingReplies map[messageId]*pendingReply
 }
 
-func newHost(addr *net.UDPAddr, peers map[hostId]string, topics map[topic]struct{}) *host {
+func newHost(addr *net.UDPAddr, peers map[hostId]state, topics map[topic]struct{}) *host {
 	return &host{
 		UDPAddr:        addr,
 		peers:          peers,
@@ -148,6 +149,13 @@ func withHost(host *host, f func()) {
 	defer host.Unlock()
 	f()
 }
+
+type state int
+
+const (
+	active state = iota
+	unresponsive
+)
 
 type message struct {
 	hostId
@@ -176,16 +184,16 @@ type joinRequestBody struct {
 
 type joinReplyBody struct {
 	Topics map[topic]struct{} `codec:"subs,omitempty"`
-	Peers  map[hostId]string  `codec:"hosts,omitempty"`
+	Peers  map[hostId]state   `codec:"hosts,omitempty"`
 }
 
 func newMessenger() Messenger {
 	return &messenger{
-		timeout:       DefaultTimeout,
-		retries:       DefaultRetries,
-		Logger:        defaultLogger,
-		subscriptions: subscriptions{handlers: make(handlers)},
-		peers:         peers{hosts: make(hosts)},
+		networkTimeout: DefaultNetworkTimeout,
+		publishTimeout: DefaultPublishTimeout,
+		Logger:         defaultLogger,
+		subscriptions:  subscriptions{handlers: make(handlers)},
+		peers:          peers{hosts: make(hosts)},
 	}
 }
 
@@ -219,7 +227,7 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 	codec.NewEncoder(buf, &ch).MustEncode(joinRequestBody{Topics: topics})
 	joinMessageBody := buf.Bytes()
 
-	timeoutChan := time.After(msgr.timeout)
+	timeoutChan := time.After(msgr.networkTimeout)
 	resultChan := make(chan *message)
 	toJoinChan := make(chan hostId, len(remotes)+8)
 	sentInvitations := make(map[hostId]struct{})
@@ -310,7 +318,6 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 		withPeers(msgr, func(hosts hosts) {
 			hosts[hostId(invitation)] = &host{
 				UDPAddr:        raddr,
-				state:          "unknown",
 				pendingReplies: pendingReplies,
 			}
 		})
@@ -343,19 +350,20 @@ func readLoop(msgr *messenger) {
 		switch header.MessageType {
 		case request:
 			handleRequest(msgr, msg)
-		case reply:
+		case ack, reply:
 			handleReply(msgr, msg)
 		case joinRequest:
 			handleJoinRequest(msgr, msg)
 		case joinReply:
 			handleJoinReply(msgr, msg)
 		default:
-			panic(fmt.Errorf("Read unknown message type %d", header.MessageType))
+			panic(fmt.Errorf("Read unknown message type %s", header.MessageType))
 		}
 	}
 }
 
 func handleRequest(msgr *messenger, msg *message) {
+	sendMessage(msgr, "", nil, msg.header.MessageId, ack, msg.from)
 	handler, found := Handler(nil), false
 	withSubscriptions(msgr, func(handlers handlers) {
 		handler, found = handlers[topic(msg.header.Topic)]
@@ -368,7 +376,7 @@ func handleRequest(msgr *messenger, msg *message) {
 
 	go func() {
 		result := handler(msg.header.Topic, msg.body)
-		sendMessage(msgr, msg.header.Topic, result, msg.header.MessageId, reply, msg.from)
+		sendMessage(msgr, "", result, msg.header.MessageId, reply, msg.from)
 	}()
 }
 
@@ -385,20 +393,19 @@ func handleReply(msgr *messenger, msg *message) {
 	pending, found := (*pendingReply)(nil), false
 	withHost(host, func() {
 		pending, found = host.pendingReplies[msg.header.MessageId]
-		if found {
-			delete(host.pendingReplies, msg.header.MessageId)
-		}
 	})
 
 	if found {
 		pending.resultChan <- msg
+	} else {
+		log.Printf("~~~ Received unexpected reply: %s", msg)
 	}
 }
 
 func handleJoinRequest(msgr *messenger, msg *message) {
 	reply := &joinReplyBody{
 		Topics: map[topic]struct{}{},
-		Peers:  make(map[hostId]string),
+		Peers:  make(map[hostId]state),
 	}
 
 	withSubscriptions(msgr, func(handlers handlers) {
@@ -426,7 +433,7 @@ func handleJoinRequest(msgr *messenger, msg *message) {
 	request := &joinRequestBody{}
 	decode(buf, request)
 
-	host := newHost(msg.from, make(map[hostId]string), request.Topics)
+	host := newHost(msg.from, make(map[hostId]state), request.Topics)
 
 	withPeers(msgr, func(hosts hosts) {
 		hosts[hostId(msg.hostId)] = host
@@ -455,17 +462,6 @@ func handleJoinReply(msgr *messenger, msg *message) {
 		msgr.Info("There is no message waiting for joinReply from %s", msg.from)
 	}
 }
-
-// func addSubscriber(logger Logger, subsrs subscribers, topic string, addr *net.UDPAddr) {
-// 	peer := addr.String()
-// 	topicMap, ok := subsrs[topic]
-// 	if !ok {
-// 		topicMap = make(map[string]*host)
-// 		subsrs[topic] = topicMap
-// 	}
-// 	topicMap[peer] = newHost(addr, nil)
-// 	logger.Info("Added new subscriber %s/%s", peer, topic)
-// }
 
 func logError(err error) {
 	if err != nil {
@@ -506,29 +502,67 @@ func (msgr *messenger) Publish(_topic string, body []byte) ([]byte, error) {
 	}
 
 	resultChan := make(chan *message)
-	timeoutChan := time.After(msgr.timeout)
 	msgId := newId()
+	acked := false
+	var timeoutChan <-chan time.Time
 
 	withHost(to, func() {
-		to.pendingReplies[msgId] = &pendingReply{resultChan: resultChan}
+		to.pendingReplies[msgId] = &pendingReply{
+			resultChan: resultChan,
+		}
 	})
 
 	sendMessage(msgr, _topic, body, msgId, request, to.UDPAddr)
-	select {
-	case result := <-resultChan:
-		return result.body, nil
-	case <-timeoutChan:
-		return nil, TimeoutError
+
+	for {
+		if acked {
+			timeoutChan = time.After(msgr.publishTimeout)
+		} else {
+			timeoutChan = time.After(msgr.networkTimeout)
+		}
+
+		select {
+		case result := <-resultChan:
+			switch result.header.MessageType {
+			case ack:
+				acked = true
+			case reply:
+				withHost(to, func() {
+					delete(to.pendingReplies, msgId)
+				})
+				return result.body, nil
+			}
+		case <-timeoutChan:
+			if acked {
+				return nil, TimeoutError
+			}
+			withHost(to, func() {
+				to.state = unresponsive
+			})
+			to := selectHost(msgr, topic(_topic))
+			if to == nil {
+				return []byte{}, NoSubscribersError
+			}
+			sendMessage(msgr, _topic, body, msgId, request, to.UDPAddr)
+		}
 	}
 }
 
 func selectHost(msgr *messenger, t topic) (peer *host) {
 	withPeers(msgr, func(hosts hosts) {
 		subscribers := ([]*host)(nil)
+		unresponsive := ([]*host)(nil)
 		for _, host := range hosts {
 			if _, ok := host.topics[t]; ok {
-				subscribers = append(subscribers, host)
+				if host.state == active {
+					subscribers = append(subscribers, host)
+				} else {
+					subscribers = append(subscribers, host)
+				}
 			}
+		}
+		if len(subscribers) == 0 {
+			subscribers = unresponsive
 		}
 		if len(subscribers) == 0 {
 			return
@@ -544,12 +578,12 @@ func (msgr *messenger) Broadcast(topic string, body []byte) ([][]byte, error) {
 	return nil, nil
 }
 
-func (msgr *messenger) SetTimeout(timeout time.Duration) {
-	msgr.timeout = timeout
+func (msgr *messenger) SetNetworkTimeout(timeout time.Duration) {
+	msgr.networkTimeout = timeout
 }
 
-func (msgr *messenger) SetRetries(retries int) {
-	msgr.retries = retries
+func (msgr *messenger) SetPublishTimeout(timeout time.Duration) {
+	msgr.publishTimeout = timeout
 }
 
 func (msgr *messenger) SetLogger(logger Logger) {
@@ -615,6 +649,8 @@ func (mType messageType) String() string {
 		return "pongReply"
 	case request:
 		return "request"
+	case ack:
+		return "ack"
 	case reply:
 		return "reply"
 	case joinRequest:
