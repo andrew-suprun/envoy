@@ -14,6 +14,7 @@ var localAddrFlag = flag.String("local", "127.0.0.1:55555", "Local address to bi
 var remoteAddrFlag = flag.String("remote", "", "Remote address to join cluster.")
 
 func main() {
+	log.SetFlags(log.Lmicroseconds)
 	flag.Parse()
 	msgr := messenger.NewMessenger()
 	err := msgr.Subscribe("job", handler)

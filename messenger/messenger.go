@@ -62,8 +62,6 @@ type Handler func(topic string, body []byte) []byte
 // impl
 //
 
-const messageIdSize = 16
-
 const (
 	pingRequest messageType = iota
 	pongReply
@@ -80,44 +78,112 @@ const (
 )
 
 const (
+	active state = iota
+	unresponsive
+)
+
+const (
+	messageIdSize   = 16
 	maxBodyPartSize = 8 * 1024
 	bufferSize      = maxBodyPartSize + 8
 )
 
 type (
-	topic          string
-	hostId         string
-	messageId      [messageIdSize]byte
-	messageType    int
-	handlers       map[topic]Handler
-	hosts          map[hostId]*host
-	pendingReplies map[messageId]*pendingReply
+	topic           string
+	hostId          string
+	messageId       [messageIdSize]byte
+	messageType     int
+	handlers        map[topic]Handler
+	hosts           map[hostId]*host
+	pendingReplies  map[messageId]*pendingReply
+	partialMessages map[messageId]*partialMessage
+	state           int
+
+	messenger struct {
+		*net.UDPAddr
+		*net.UDPConn
+		Logger
+		subscriptions
+		peers
+		networkTimeout time.Duration
+		publishTimeout time.Duration
+
+		// partialMessages are accessed from single readLoop goroutine
+		// hence they need not be protected by mutex
+		partialMessages
+		partialMessagesHead *partialMessageNode
+		partialMessagesTail *partialMessageNode
+	}
+
+	peers struct {
+		sync.Mutex
+		hosts
+	}
+
+	host struct {
+		sync.Mutex
+		hostId
+		*net.UDPAddr
+		state
+		pendingReplies
+		peers  map[hostId]state
+		topics map[topic]struct{}
+	}
+
+	message struct {
+		messageId
+		messageType
+		parts [][]byte
+	}
+
+	result struct {
+		*host
+		*header
+		body []byte
+	}
+
+	header struct {
+		MessageId   messageId   `codec:"id"`
+		MessageType messageType `codec:"mt"`
+		Topic       string      `codec:"t,omitempty"`
+		BodyLen     int         `codec:"bl,omitempty"`
+		PartIndex   int         `codec:"pi,omitempty"`
+		PartOffset  int         `codec:"po,omitempty"`
+	}
+
+	pendingReply struct {
+		resultChan chan *result
+	}
+
+	partialMessage struct {
+		time.Time
+		results []result
+	}
+
+	partialMessageNode struct {
+		*partialMessage
+		next *partialMessageNode
+	}
+
+	joinRequestBody struct {
+		Topics map[topic]struct{} `codec:"subs,omitempty"`
+	}
+
+	joinReplyBody struct {
+		Topics map[topic]struct{} `codec:"subs,omitempty"`
+		Peers  map[hostId]state   `codec:"hosts,omitempty"`
+	}
+
+	subscriptions struct {
+		sync.Mutex
+		handlers
+	}
 )
-
-type messenger struct {
-	*net.UDPAddr
-	*net.UDPConn
-	Logger
-	subscriptions
-	peers
-	networkTimeout time.Duration
-	publishTimeout time.Duration
-}
-
-type subscriptions struct {
-	sync.Mutex
-	handlers
-}
 
 func withSubscriptions(msgr *messenger, f func(handlers)) {
 	msgr.subscriptions.Lock()
 	defer msgr.subscriptions.Unlock()
 	f(msgr.subscriptions.handlers)
-}
-
-type peers struct {
-	sync.Mutex
-	hosts
 }
 
 func withPeers(msgr *messenger, f func(hosts)) {
@@ -126,20 +192,10 @@ func withPeers(msgr *messenger, f func(hosts)) {
 	f(msgr.peers.hosts)
 }
 
-type host struct {
-	sync.Mutex
-	*net.UDPAddr
-	state
-	peers          map[hostId]state
-	topics         map[topic]struct{}
-	pendingReplies map[messageId]*pendingReply
-}
-
-func newHost(addr *net.UDPAddr, peers map[hostId]state, topics map[topic]struct{}) *host {
+func newHost(addr *net.UDPAddr) *host {
 	return &host{
+		hostId:         hostId(addr.String()),
 		UDPAddr:        addr,
-		peers:          peers,
-		topics:         topics,
 		pendingReplies: make(pendingReplies),
 	}
 }
@@ -150,50 +206,14 @@ func withHost(host *host, f func()) {
 	f()
 }
 
-type state int
-
-const (
-	active state = iota
-	unresponsive
-)
-
-type message struct {
-	hostId
-	from *net.UDPAddr
-	*header
-	body []byte
-}
-
-type header struct {
-	MessageId   messageId   `codec:"id"`
-	MessageType messageType `codec:"mt"`
-	Topic       string      `codec:"t,omitempty"`
-	BodyLen     int         `codec:"bl,omitempty"`
-	PartIndex   int         `codec:"pi,omitempty"`
-	PartOffset  int         `codec:"po,omitempty"`
-	LastPart    bool        `codec:"lp,omitempty"`
-}
-
-type pendingReply struct {
-	resultChan chan *message
-}
-
-type joinRequestBody struct {
-	Topics map[topic]struct{} `codec:"subs,omitempty"`
-}
-
-type joinReplyBody struct {
-	Topics map[topic]struct{} `codec:"subs,omitempty"`
-	Peers  map[hostId]state   `codec:"hosts,omitempty"`
-}
-
 func newMessenger() Messenger {
 	return &messenger{
-		networkTimeout: DefaultNetworkTimeout,
-		publishTimeout: DefaultPublishTimeout,
-		Logger:         defaultLogger,
-		subscriptions:  subscriptions{handlers: make(handlers)},
-		peers:          peers{hosts: make(hosts)},
+		networkTimeout:  DefaultNetworkTimeout,
+		publishTimeout:  DefaultPublishTimeout,
+		Logger:          defaultLogger,
+		subscriptions:   subscriptions{handlers: make(handlers)},
+		peers:           peers{hosts: make(hosts)},
+		partialMessages: make(map[messageId]*partialMessage),
 	}
 }
 
@@ -227,8 +247,12 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 	codec.NewEncoder(buf, &ch).MustEncode(joinRequestBody{Topics: topics})
 	joinMessageBody := buf.Bytes()
 
+	////// new
+
+	////// old
+
 	timeoutChan := time.After(msgr.networkTimeout)
-	resultChan := make(chan *message)
+	resultChan := make(chan *result)
 	toJoinChan := make(chan hostId, len(remotes)+8)
 	sentInvitations := make(map[hostId]struct{})
 	var (
@@ -251,9 +275,19 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 				log.Printf("~~~ result: %+v", result)
 				reply := &joinReplyBody{}
 				decode(bytes.NewBuffer(result.body), reply)
-				joined = append(joined, string(result.hostId))
+				joined = append(joined, result.host.String())
 
-				fromHost := newHost(result.from, reply.Peers, reply.Topics)
+				var fromHost *host
+				withPeers(msgr, func(hosts hosts) {
+					fromHost = hosts[result.hostId]
+				})
+				if fromHost == nil {
+					msgr.Error("Received message from unknown host %s. Ignoring.", result.hostId)
+					continue
+				}
+				fromHost.peers = reply.Peers
+				fromHost.topics = reply.Topics
+
 				withPeers(msgr, func(hosts hosts) {
 					hosts[result.hostId] = fromHost
 				})
@@ -315,15 +349,14 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 			},
 		}
 
+		host := newHost(raddr)
+		host.pendingReplies = pendingReplies
 		withPeers(msgr, func(hosts hosts) {
-			hosts[hostId(invitation)] = &host{
-				UDPAddr:        raddr,
-				pendingReplies: pendingReplies,
-			}
+			hosts[hostId(invitation)] = host
 		})
 
 		log.Printf("~~~ inviting %s", invitation)
-		sendMessage(msgr, "", joinMessageBody, requestId, joinRequest, raddr)
+		sendMessage(msgr, newMessage("", joinMessageBody, requestId, joinRequest), host)
 	}
 
 	return
@@ -333,6 +366,7 @@ func readLoop(msgr *messenger) {
 	byteSlice := make([]byte, bufferSize)
 	for {
 		n, from, err := msgr.ReadFromUDP(byteSlice) // TODO: Shutdown on closed connection
+		msgr.Debug("readLoop.01: read %d bytes from %s; err = %v", n, from, err)
 		if err != nil {
 			logError(err)
 			continue
@@ -340,69 +374,161 @@ func readLoop(msgr *messenger) {
 		if n == 0 {
 			continue
 		}
+		now := time.Now()
+		hId := hostId(from.String())
 		buf := bytes.NewBuffer(byteSlice[:n])
 		header := decodeHeader(buf)
 		body := make([]byte, buf.Len())
 		copy(body, buf.Bytes())
 
-		msg := &message{hostId: hostId(from.String()), from: from, header: header, body: body}
+		if header.MessageType != ack {
+			ackn := newMessage("", nil, header.MessageId, ack)
+			msgr.Debug("readLoop.02: sending ack to %s (%d bytes)", from, len(ackn.parts[0]))
+			n, err = msgr.WriteToUDP(ackn.parts[0], from)
+			msgr.Debug("readLoop.03: sent ack to %s (%d bytes); err = %v", from, n, err)
+		}
+
+		var host *host
+		withPeers(msgr, func(hosts hosts) {
+			host = hosts[hId]
+		})
+
+		if host == nil {
+			if header.MessageType == joinRequest {
+				host = newHost(from)
+				withPeers(msgr, func(hosts hosts) {
+					hosts[hId] = host
+				})
+			} else {
+				msgr.Error("Received message from unknown host %s. Ignoring.", from)
+				continue
+			}
+		}
+
+		msgr.Debug("readLoop.04: host = %s", host)
+		res := &result{host: host, header: header, body: body}
+		msgr.Debug("readLoop.05: res = %s", res)
+
+		// collect all parts
+		if header.BodyLen > len(body) {
+			pMsg := msgr.partialMessages[header.MessageId]
+			if pMsg == nil {
+				pMsg = &partialMessage{Time: now, results: []result{result{host: host, header: header, body: body}}}
+				msgr.partialMessages[header.MessageId] = pMsg
+			} else {
+				pMsg.results = append(pMsg.results, result{host: host, header: header, body: body})
+			}
+			res.body = joinParts(pMsg)
+			if res.body == nil {
+				continue
+			}
+		}
 
 		switch header.MessageType {
 		case request:
-			handleRequest(msgr, msg)
+			go handleRequest(msgr, res)
 		case ack, reply:
-			handleReply(msgr, msg)
+			go handleReply(msgr, res)
 		case joinRequest:
-			handleJoinRequest(msgr, msg)
+			go handleJoinRequest(msgr, res)
 		case joinReply:
-			handleJoinReply(msgr, msg)
+			go handleJoinReply(msgr, res)
 		default:
 			panic(fmt.Errorf("Read unknown message type %s", header.MessageType))
+		}
+
+		expiration := now.Add(-msgr.networkTimeout)
+		for msgr.partialMessagesHead != nil && msgr.partialMessagesHead.Time.Before(expiration) {
+			delete(msgr.partialMessages, msgr.partialMessagesHead.partialMessage.results[0].MessageId)
+			msgr.partialMessagesHead = msgr.partialMessagesHead.next
 		}
 	}
 }
 
-func handleRequest(msgr *messenger, msg *message) {
-	sendMessage(msgr, "", nil, msg.header.MessageId, ack, msg.from)
+func joinParts(pm *partialMessage) []byte {
+	// all results are already sorted here with possible exception of the last one
+
+	lastIndex := len(pm.results) - 1
+	index := lastIndex
+	lastOffset := pm.results[lastIndex].PartOffset
+	for index > 0 && pm.results[index-1].PartOffset > lastOffset {
+		index--
+	}
+	if index < lastIndex {
+		if pm.results[index].PartOffset == lastOffset {
+			// ignore duplicate part
+			pm.results = pm.results[:lastIndex]
+		} else {
+			lastResult := pm.results[lastIndex]
+			copy(pm.results[index+1:], pm.results[index:])
+			pm.results[index] = lastResult
+		}
+	}
+
+	offset := 0
+	// for index := 0; index <= lastIndex; index++ {
+	for _, result := range pm.results {
+		if result.PartOffset != offset {
+			return nil
+		}
+		offset += len(result.body)
+	}
+
+	bodyLen := pm.results[0].BodyLen
+
+	if offset != bodyLen {
+		return nil
+	}
+
+	body := make([]byte, bodyLen)
+	for _, result := range pm.results {
+		copy(body[result.PartOffset:], result.body)
+	}
+
+	return body
+}
+
+func handleRequest(msgr *messenger, res *result) {
 	handler, found := Handler(nil), false
 	withSubscriptions(msgr, func(handlers handlers) {
-		handler, found = handlers[topic(msg.header.Topic)]
+		handler, found = handlers[topic(res.header.Topic)]
 	})
 
 	if !found {
-		msgr.Info("Received request for non-subscribed topic %s. Ignored.", msg.header.Topic)
+		msgr.Info("Received request for non-subscribed topic %s. Ignored.", res.header.Topic)
 		return
 	}
 
 	go func() {
-		result := handler(msg.header.Topic, msg.body)
-		sendMessage(msgr, "", result, msg.header.MessageId, reply, msg.from)
+		result := handler(res.header.Topic, res.body)
+		sendMessage(msgr, newMessage("", result, res.header.MessageId, reply), res.host)
 	}()
 }
 
-func handleReply(msgr *messenger, msg *message) {
+func handleReply(msgr *messenger, res *result) {
 	host, ok := (*host)(nil), false
 	withPeers(msgr, func(hosts hosts) {
-		host, ok = hosts[msg.hostId]
+		host, ok = hosts[res.hostId]
 	})
 	if !ok {
-		logError(fmt.Errorf("Received reply from unknown peer %s. Ignoring.", msg.hostId))
+		logError(fmt.Errorf("Received reply from unknown peer %s. Ignoring.", res.hostId))
 		return
 	}
 
 	pending, found := (*pendingReply)(nil), false
 	withHost(host, func() {
-		pending, found = host.pendingReplies[msg.header.MessageId]
+		pending, found = host.pendingReplies[res.header.MessageId]
 	})
 
 	if found {
-		pending.resultChan <- msg
+		pending.resultChan <- res
 	} else {
-		log.Printf("~~~ Received unexpected reply: %s", msg)
+		log.Printf("~~~ Received unexpected reply: %s", res)
 	}
 }
 
-func handleJoinRequest(msgr *messenger, msg *message) {
+func handleJoinRequest(msgr *messenger, res *result) {
+	msgr.Debug("handleJoinRequest: res = %s", res)
 	reply := &joinReplyBody{
 		Topics: map[topic]struct{}{},
 		Peers:  make(map[hostId]state),
@@ -423,43 +549,48 @@ func handleJoinRequest(msgr *messenger, msg *message) {
 	buf := &bytes.Buffer{}
 	encode(reply, buf)
 
-	err := sendMessage(msgr, "", buf.Bytes(), msg.header.MessageId, joinReply, msg.from)
+	_, err := sendMessage(msgr, newMessage("", buf.Bytes(), res.header.MessageId, joinReply), res.host)
 	if err != nil {
-		msgr.Info("Failed to send join reply message to %s: %s", msg.from, err.Error())
+		msgr.Info("Failed to send join reply message to %s: %s", res.hostId, err.Error())
 		return
 	}
 
-	buf = bytes.NewBuffer(msg.body)
+	buf = bytes.NewBuffer(res.body)
 	request := &joinRequestBody{}
 	decode(buf, request)
 
-	host := newHost(msg.from, make(map[hostId]state), request.Topics)
-
-	withPeers(msgr, func(hosts hosts) {
-		hosts[hostId(msg.hostId)] = host
+	withHost(res.host, func() {
+		res.topics = request.Topics
 	})
-	msgr.Info("Joined %s", msg.hostId)
+
+	msgr.Info("Joined %s", res.hostId)
 }
 
-func handleJoinReply(msgr *messenger, msg *message) {
-	buf := bytes.NewBuffer(msg.body)
+func handleJoinReply(msgr *messenger, res *result) {
+	msgr.Debug("handleJoinReply: res = %s", res)
+	buf := bytes.NewBuffer(res.body)
 	reply := &joinReplyBody{}
 	decode(buf, reply)
 
 	var peer *host
 	withPeers(msgr, func(hosts hosts) {
-		peer = hosts[hostId(msg.hostId)]
+		peer = hosts[hostId(res.hostId)]
 	})
+
+	if peer == nil {
+		msgr.Error("Received joinReply from unexpected host '%s'. Ignoring.", res.hostId)
+		return
+	}
 
 	pr, prFound := (*pendingReply)(nil), false
 	withHost(peer, func() {
-		pr, prFound = peer.pendingReplies[msg.header.MessageId]
+		pr, prFound = peer.pendingReplies[res.header.MessageId]
 	})
 
 	if prFound {
-		pr.resultChan <- msg
+		pr.resultChan <- res
 	} else {
-		msgr.Info("There is no message waiting for joinReply from %s", msg.from)
+		msgr.Error("There is no message waiting for joinReply from %s", res.hostId)
 	}
 }
 
@@ -496,56 +627,142 @@ func (msgr *messenger) Unsubscribe(_topic string) error {
 }
 
 func (msgr *messenger) Publish(_topic string, body []byte) ([]byte, error) {
+
 	to := selectHost(msgr, topic(_topic))
 	if to == nil {
 		return []byte{}, NoSubscribersError
 	}
 
-	resultChan := make(chan *message)
 	msgId := newId()
-	acked := false
-	var timeoutChan <-chan time.Time
+
+	// TODO: Handle timeouts
+	return sendMessage(msgr, newMessage(_topic, body, msgId, request), to)
+}
+
+func newMessage(topic string, body []byte, msgId messageId, msgType messageType) *message {
+	log.Printf("~~~ newMessage: topic = %s; len(body) = %d; msgId = %s; msgType = %s", topic, len(body), msgId, msgType)
+	bodyLen := len(body)
+	partIndex := 0
+	partOffset := 0
+	parts := make([][]byte, 0, bodyLen/(maxBodyPartSize+40)+1)
+
+	for partOffset <= bodyLen {
+		msgHeader := header{
+			Topic:       topic,
+			MessageId:   msgId,
+			MessageType: msgType,
+			BodyLen:     bodyLen,
+			PartIndex:   partIndex,
+			PartOffset:  partOffset,
+		}
+
+		buf := bytes.Buffer{}
+		enc := codec.NewEncoder(&buf, &ch)
+		enc.MustEncode(msgHeader)
+
+		if partOffset == bodyLen {
+			parts = append(parts, buf.Bytes())
+			break
+		}
+
+		capacity := maxBodyPartSize - buf.Len()
+		remaining := bodyLen - partOffset
+		if capacity >= remaining {
+			buf.Write(body[partOffset:])
+			parts = append(parts, buf.Bytes())
+			break
+		} else {
+			buf.Write(body[partOffset : partOffset+capacity])
+			parts = append(parts, buf.Bytes())
+			partOffset += capacity
+			partIndex++
+		}
+	}
+	return &message{
+		messageId:   msgId,
+		messageType: msgType,
+		parts:       parts,
+	}
+}
+
+func sendMessage(msgr *messenger, parts *message, to *host) ([]byte, error) {
+	msgr.Debug("sendMessage.01: parts = %s; to = %s", parts, to)
+	resultChan := make(chan *result)
 
 	withHost(to, func() {
-		to.pendingReplies[msgId] = &pendingReply{
+		to.pendingReplies[parts.messageId] = &pendingReply{
 			resultChan: resultChan,
 		}
 	})
 
-	sendMessage(msgr, _topic, body, msgId, request, to.UDPAddr)
+	var timeoutChan <-chan time.Time
+	if isSync(parts.messageType) {
+		timeoutChan = time.After(msgr.publishTimeout)
+	} else {
+		timeoutChan = time.After(msgr.networkTimeout)
+	}
+
+	acked := make([]bool, len(parts.parts))
+	timeout := 50 * time.Millisecond
+
+	for _, part := range parts.parts {
+		msgr.Debug("sendMessage.02: writing %d bytes to %s", len(part), to.hostId)
+		_, err := msgr.WriteToUDP(part, to.UDPAddr)
+		msgr.Debug("sendMessage.03: wrote %d bytes to %s; err = %v", len(part), to.hostId, err)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	for {
-		if acked {
-			timeoutChan = time.After(msgr.publishTimeout)
-		} else {
-			timeoutChan = time.After(msgr.networkTimeout)
-		}
-
 		select {
 		case result := <-resultChan:
-			switch result.header.MessageType {
-			case ack:
-				acked = true
-			case reply:
+			msgr.Debug("sendMessage.04: result = %v", result)
+			if result.header.MessageType == ack {
+				acked[result.header.PartIndex] = true
+				if !isSync(parts.messageType) && allAcked(acked) {
+					return nil, nil
+				}
+			} else {
 				withHost(to, func() {
-					delete(to.pendingReplies, msgId)
+					delete(to.pendingReplies, parts.messageId)
 				})
 				return result.body, nil
 			}
-		case <-timeoutChan:
-			if acked {
-				return nil, TimeoutError
+		case <-time.After(timeout):
+			msgr.Debug("sendMessage.05: timeout = %v", timeout)
+			timeout = 2 * timeout
+			for i, part := range parts.parts {
+				if !acked[i] {
+					msgr.Debug("sendMessage.06: writing %d bytes to %s", len(part), to.hostId)
+					_, err := msgr.WriteToUDP(part, to.UDPAddr)
+					msgr.Debug("sendMessage.07: wrote %d bytes to %s; err = %v", len(part), to.hostId, err)
+					if err != nil {
+						return nil, err
+					}
+				}
 			}
+		case <-timeoutChan:
+			msgr.Debug("sendMessage.08: timed out")
 			withHost(to, func() {
 				to.state = unresponsive
 			})
-			to := selectHost(msgr, topic(_topic))
-			if to == nil {
-				return []byte{}, NoSubscribersError
-			}
-			sendMessage(msgr, _topic, body, msgId, request, to.UDPAddr)
+			return nil, TimeoutError
 		}
 	}
+}
+
+func isSync(msgType messageType) bool {
+	return msgType == request || msgType == subscribeRequest || msgType == joinRequest
+}
+
+func allAcked(acked []bool) bool {
+	for _, a := range acked {
+		if !a {
+			return false
+		}
+	}
+	return true
 }
 
 func selectHost(msgr *messenger, t topic) (peer *host) {
@@ -596,23 +813,6 @@ func newHeader(topic string, msgType messageType) *header {
 		MessageType: msgType,
 		Topic:       topic,
 	}
-}
-
-func sendMessage(msgr *messenger, topic string, body []byte, msgId messageId, msgType messageType, to *net.UDPAddr) error {
-	msgHeader := header{
-		Topic:       topic,
-		MessageId:   msgId,
-		MessageType: msgType,
-		LastPart:    true,
-	}
-
-	buf := bytes.Buffer{}
-	enc := codec.NewEncoder(&buf, &ch)
-	enc.MustEncode(msgHeader)
-	buf.Write(body)
-
-	_, err := msgr.WriteToUDP(buf.Bytes(), to)
-	return err
 }
 
 var ch codec.CborHandle
@@ -672,8 +872,24 @@ func (mType messageType) String() string {
 	}
 }
 
-func (msg *message) String() string {
-	return fmt.Sprintf("[message: from: %s; header: %s; body %s]", msg.from, msg.header, string(msg.body))
+func (s state) String() string {
+	switch s {
+	case active:
+		return "active"
+	case unresponsive:
+		return "unresponsive"
+	default:
+		return "unknown"
+	}
+}
+
+func (h *host) String() string {
+	return fmt.Sprintf("[host: id: %s; state %s; topics %d; peers %d; pendingReplies %d; ]", h.hostId, h.state,
+		len(h.topics), len(h.peers), len(h.pendingReplies))
+}
+
+func (res *result) String() string {
+	return fmt.Sprintf("[result: from: %s; %s; body %d]", res.host, res.header, len(res.body))
 }
 
 func (h *header) String() string {

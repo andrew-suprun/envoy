@@ -20,6 +20,7 @@ var errCount int64
 var wg sync.WaitGroup
 
 func main() {
+	log.SetFlags(log.Lmicroseconds)
 	start := time.Now()
 	flag.Parse()
 	run()
