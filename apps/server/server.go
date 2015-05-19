@@ -5,15 +5,15 @@ import (
 	"fmt"
 	"github.com/andrew-suprun/envoy/messenger"
 	"log"
-	"math/rand"
+	"runtime"
 	"strings"
-	"time"
 )
 
 var localAddrFlag = flag.String("local", "127.0.0.1:55555", "Local address to bind to.")
-var remoteAddrFlag = flag.String("remote", "", "Remote address to join cluster.")
+var remoteAddrFlag = flag.String("remotes", "", "Comma separated remote addresses.")
 
 func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	log.SetFlags(log.Lmicroseconds)
 	flag.Parse()
 	msgr := messenger.NewMessenger()
@@ -25,13 +25,9 @@ func main() {
 	remotes := []string{}
 	if *remoteAddrFlag != "" {
 		remotes = strings.Split(*remoteAddrFlag, ",")
-		log.Printf("Joining %s", remotes)
 	}
 
-	joined, err := msgr.Join(*localAddrFlag, remotes)
-	if len(joined) > 0 {
-		log.Printf("Joined %s", joined)
-	}
+	_, err = msgr.Join(*localAddrFlag, remotes)
 	if err != nil {
 		log.Printf("Error: %v", err)
 	}
@@ -40,9 +36,8 @@ func main() {
 }
 
 func handler(topic string, body []byte) []byte {
-	time.Sleep(time.Duration(rand.Intn(30000)+20000) * time.Microsecond)
 	result := append([]byte("Received "), body...)
-	fmt.Printf(">>> %s\n", string(result))
+	fmt.Println(string(result))
 	return result
 }
 

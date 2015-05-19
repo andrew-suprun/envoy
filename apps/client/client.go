@@ -5,11 +5,17 @@ import (
 	"fmt"
 	"github.com/andrew-suprun/envoy/messenger"
 	"log"
+	"math/rand"
 	"os"
+	"runtime"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
+)
+
+const (
+	threads = 10000
+	jobs    = 10
 )
 
 var localAddrFlag = flag.String("local", "", "Local address.")
@@ -17,13 +23,14 @@ var remoteAddrFlag = flag.String("remotes", "", "Comma separated remote addresse
 
 var okCount int64
 var errCount int64
-var wg sync.WaitGroup
 
 func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	log.SetFlags(log.Lmicroseconds)
 	start := time.Now()
 	flag.Parse()
 	run()
+	time.Sleep(time.Minute)
 	fmt.Printf("Handled OK %d; Errored %d; Duration %s\n", okCount, errCount, time.Now().Sub(start))
 }
 
@@ -35,21 +42,13 @@ func run() {
 		if len(joined) == 0 {
 			fmt.Printf("Failed to join. Exiting\n")
 			os.Exit(1)
-		} else {
-			fmt.Printf("Joined %s\n", joined)
 		}
 	}
 
-	// for i := 1; i <= 10; i++ {
-	// 	msgr.Publish("job", []byte(fmt.Sprintf("foo %d", i)))
-	// }
-	// os.Exit(0)
-
-	wg.Add(2000)
-	for i := 1; i <= 2000; i++ {
+	for i := 1; i <= threads; i++ {
 		thread := i
 		go func(thread int) {
-			for job := 1; job <= 100; job++ {
+			for job := 1; ; job++ {
 				out := fmt.Sprintf("--- %s: thread #%d job #%d ---", *localAddrFlag, thread, job)
 				outBuf := []byte(out)
 				start := time.Now()
@@ -60,12 +59,12 @@ func run() {
 					atomic.AddInt64(&errCount, 1)
 				}
 				logError(err)
-				fmt.Printf("%s: %s\n", string(result), time.Now().Sub(start))
+				fmt.Printf("%s: %f\n", string(result), time.Now().Sub(start).Seconds())
+				time.Sleep(time.Duration(rand.Intn(1000)+1000) * time.Millisecond)
 			}
-			wg.Done()
 		}(thread)
+		time.Sleep(200 * time.Microsecond)
 	}
-	wg.Wait()
 }
 
 func handler(topic string, body []byte) []byte {

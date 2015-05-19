@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/ugorji/go/codec"
-	"log"
 	mRand "math/rand"
 	"net"
 	"sync"
@@ -140,6 +139,7 @@ type (
 		*host
 		*header
 		body []byte
+		err  error
 	}
 
 	header struct {
@@ -228,7 +228,7 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("Listening on: %s", local)
+	msgr.Info("Listening on: %s", local)
 
 	go readLoop(msgr)
 
@@ -249,11 +249,7 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 
 	////// new
 
-	////// old
-
-	timeoutChan := time.After(msgr.networkTimeout)
-	resultChan := make(chan *result)
-	toJoinChan := make(chan hostId, len(remotes)+8)
+	toJoinChan := make(chan hostId, len(remotes))
 	sentInvitations := make(map[hostId]struct{})
 	var (
 		invitationMutex sync.Mutex
@@ -267,12 +263,13 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 
 	atomic.AddInt64(&sent, int64(len(remotes)))
 
+	timeoutChan := time.After(msgr.networkTimeout)
+	resultChan := make(chan *result)
+
 	go func() {
 		for {
-			log.Printf("~~~ for")
 			select {
 			case result := <-resultChan:
-				log.Printf("~~~ result: %+v", result)
 				reply := &joinReplyBody{}
 				decode(bytes.NewBuffer(result.body), reply)
 				joined = append(joined, result.host.String())
@@ -305,7 +302,6 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 							invitationMutex.Unlock()
 
 							if !alreadySent {
-								log.Printf("~~~ Join: to join: %s", peer)
 								atomic.AddInt64(&sent, 1)
 								toJoinChan <- peer
 							}
@@ -315,12 +311,10 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 				s := atomic.LoadInt64(&sent)
 				r := atomic.AddInt64(&received, 1)
 				if s == r {
-					log.Printf("~~~ break")
 					close(toJoinChan)
 					return
 				}
 			case <-timeoutChan:
-				log.Printf("~~~ timeout")
 				err = TimeoutError
 				close(toJoinChan)
 				return
@@ -329,8 +323,6 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 	}()
 
 	for invitation := range toJoinChan {
-		log.Printf("~~~ invitation = %s", invitation)
-		log.Printf("~~~ toJoinChan = %d", len(toJoinChan))
 		raddr, err := net.ResolveUDPAddr("udp", string(invitation))
 		if err != nil {
 			msgr.Info("Failed to resolve address %s (%v). Ignoring.", invitation, err)
@@ -343,20 +335,16 @@ func (msgr *messenger) Join(local string, remotes []string) (joined []string, er
 		invitationMutex.Unlock()
 
 		requestId := newId()
-		pendingReplies := pendingReplies{
-			requestId: &pendingReply{
-				resultChan: resultChan,
-			},
-		}
 
 		host := newHost(raddr)
-		host.pendingReplies = pendingReplies
 		withPeers(msgr, func(hosts hosts) {
 			hosts[hostId(invitation)] = host
 		})
 
-		log.Printf("~~~ inviting %s", invitation)
-		sendMessage(msgr, newMessage("", joinMessageBody, requestId, joinRequest), host)
+		go func() {
+			body, err := sendMessage(msgr, newMessage("", joinMessageBody, requestId, joinRequest), host)
+			resultChan <- &result{host: host, body: body, err: err}
+		}()
 	}
 
 	return
@@ -366,9 +354,8 @@ func readLoop(msgr *messenger) {
 	byteSlice := make([]byte, bufferSize)
 	for {
 		n, from, err := msgr.ReadFromUDP(byteSlice) // TODO: Shutdown on closed connection
-		msgr.Debug("readLoop.01: read %d bytes from %s; err = %v", n, from, err)
 		if err != nil {
-			logError(err)
+			msgr.Logger.Error("Failed to read from UDP socket: %v", err)
 			continue
 		}
 		if n == 0 {
@@ -380,12 +367,12 @@ func readLoop(msgr *messenger) {
 		header := decodeHeader(buf)
 		body := make([]byte, buf.Len())
 		copy(body, buf.Bytes())
+		msgr.Debug("<<< %s/%s(%d)", header.MessageId, header.MessageType, header.PartIndex)
 
 		if header.MessageType != ack {
 			ackn := newMessage("", nil, header.MessageId, ack)
-			msgr.Debug("readLoop.02: sending ack to %s (%d bytes)", from, len(ackn.parts[0]))
+			msgr.Debug(">1> %s/%s(%d)", header.MessageId, ack, header.PartIndex)
 			n, err = msgr.WriteToUDP(ackn.parts[0], from)
-			msgr.Debug("readLoop.03: sent ack to %s (%d bytes); err = %v", from, n, err)
 		}
 
 		var host *host
@@ -405,9 +392,7 @@ func readLoop(msgr *messenger) {
 			}
 		}
 
-		msgr.Debug("readLoop.04: host = %s", host)
 		res := &result{host: host, header: header, body: body}
-		msgr.Debug("readLoop.05: res = %s", res)
 
 		// collect all parts
 		if header.BodyLen > len(body) {
@@ -491,17 +476,17 @@ func joinParts(pm *partialMessage) []byte {
 func handleRequest(msgr *messenger, res *result) {
 	handler, found := Handler(nil), false
 	withSubscriptions(msgr, func(handlers handlers) {
-		handler, found = handlers[topic(res.header.Topic)]
+		handler, found = handlers[topic(res.Topic)]
 	})
 
 	if !found {
-		msgr.Info("Received request for non-subscribed topic %s. Ignored.", res.header.Topic)
+		msgr.Info("Received request for non-subscribed topic %s. Ignored.", res.Topic)
 		return
 	}
 
 	go func() {
-		result := handler(res.header.Topic, res.body)
-		sendMessage(msgr, newMessage("", result, res.header.MessageId, reply), res.host)
+		result := handler(res.Topic, res.body)
+		sendMessage(msgr, newMessage("", result, res.MessageId, reply), res.host)
 	}()
 }
 
@@ -511,24 +496,25 @@ func handleReply(msgr *messenger, res *result) {
 		host, ok = hosts[res.hostId]
 	})
 	if !ok {
-		logError(fmt.Errorf("Received reply from unknown peer %s. Ignoring.", res.hostId))
+		msgr.Logger.Error("Received reply from unknown peer %s. Ignoring.", res.hostId)
 		return
 	}
 
 	pending, found := (*pendingReply)(nil), false
 	withHost(host, func() {
-		pending, found = host.pendingReplies[res.header.MessageId]
+		pending, found = host.pendingReplies[res.MessageId]
 	})
 
 	if found {
 		pending.resultChan <- res
-	} else {
-		log.Printf("~~~ Received unexpected reply: %s", res)
+		// } else {
+		// log.Printf("~~~ Received unexpected reply[%T]: %s", res, res)
+		// log.Printf("~~~ messageId = %s\n%s", res.MessageId)
+		// os.Exit(1)
 	}
 }
 
 func handleJoinRequest(msgr *messenger, res *result) {
-	msgr.Debug("handleJoinRequest: res = %s", res)
 	reply := &joinReplyBody{
 		Topics: map[topic]struct{}{},
 		Peers:  make(map[hostId]state),
@@ -549,7 +535,7 @@ func handleJoinRequest(msgr *messenger, res *result) {
 	buf := &bytes.Buffer{}
 	encode(reply, buf)
 
-	_, err := sendMessage(msgr, newMessage("", buf.Bytes(), res.header.MessageId, joinReply), res.host)
+	_, err := sendMessage(msgr, newMessage("", buf.Bytes(), res.MessageId, joinReply), res.host)
 	if err != nil {
 		msgr.Info("Failed to send join reply message to %s: %s", res.hostId, err.Error())
 		return
@@ -567,7 +553,6 @@ func handleJoinRequest(msgr *messenger, res *result) {
 }
 
 func handleJoinReply(msgr *messenger, res *result) {
-	msgr.Debug("handleJoinReply: res = %s", res)
 	buf := bytes.NewBuffer(res.body)
 	reply := &joinReplyBody{}
 	decode(buf, reply)
@@ -584,19 +569,13 @@ func handleJoinReply(msgr *messenger, res *result) {
 
 	pr, prFound := (*pendingReply)(nil), false
 	withHost(peer, func() {
-		pr, prFound = peer.pendingReplies[res.header.MessageId]
+		pr, prFound = peer.pendingReplies[res.MessageId]
 	})
 
 	if prFound {
 		pr.resultChan <- res
 	} else {
 		msgr.Error("There is no message waiting for joinReply from %s", res.hostId)
-	}
-}
-
-func logError(err error) {
-	if err != nil {
-		log.Printf("### Error[%T]: %v", err, err)
 	}
 }
 
@@ -640,7 +619,6 @@ func (msgr *messenger) Publish(_topic string, body []byte) ([]byte, error) {
 }
 
 func newMessage(topic string, body []byte, msgId messageId, msgType messageType) *message {
-	log.Printf("~~~ newMessage: topic = %s; len(body) = %d; msgId = %s; msgType = %s", topic, len(body), msgId, msgType)
 	bodyLen := len(body)
 	partIndex := 0
 	partOffset := 0
@@ -686,7 +664,6 @@ func newMessage(topic string, body []byte, msgId messageId, msgType messageType)
 }
 
 func sendMessage(msgr *messenger, parts *message, to *host) ([]byte, error) {
-	msgr.Debug("sendMessage.01: parts = %s; to = %s", parts, to)
 	resultChan := make(chan *result)
 
 	withHost(to, func() {
@@ -695,20 +672,20 @@ func sendMessage(msgr *messenger, parts *message, to *host) ([]byte, error) {
 		}
 	})
 
-	var timeoutChan <-chan time.Time
-	if isSync(parts.messageType) {
-		timeoutChan = time.After(msgr.publishTimeout)
-	} else {
-		timeoutChan = time.After(msgr.networkTimeout)
-	}
+	// var timeoutChan <-chan time.Time
+	// if isSync(parts.messageType) {
+	// 	timeoutChan = time.After(msgr.publishTimeout)
+	// } else {
+	// 	timeoutChan = time.After(msgr.networkTimeout)
+	// }
+	timeoutChan := time.After(msgr.publishTimeout)
 
 	acked := make([]bool, len(parts.parts))
-	timeout := 50 * time.Millisecond
+	timeout := 100 * time.Millisecond
 
-	for _, part := range parts.parts {
-		msgr.Debug("sendMessage.02: writing %d bytes to %s", len(part), to.hostId)
+	for i, part := range parts.parts {
+		msgr.Debug(">2> %s/%s(%d)", parts.messageId, parts.messageType, i)
 		_, err := msgr.WriteToUDP(part, to.UDPAddr)
-		msgr.Debug("sendMessage.03: wrote %d bytes to %s; err = %v", len(part), to.hostId, err)
 		if err != nil {
 			return nil, err
 		}
@@ -717,7 +694,6 @@ func sendMessage(msgr *messenger, parts *message, to *host) ([]byte, error) {
 	for {
 		select {
 		case result := <-resultChan:
-			msgr.Debug("sendMessage.04: result = %v", result)
 			if result.header.MessageType == ack {
 				acked[result.header.PartIndex] = true
 				if !isSync(parts.messageType) && allAcked(acked) {
@@ -730,20 +706,18 @@ func sendMessage(msgr *messenger, parts *message, to *host) ([]byte, error) {
 				return result.body, nil
 			}
 		case <-time.After(timeout):
-			msgr.Debug("sendMessage.05: timeout = %v", timeout)
-			timeout = 2 * timeout
 			for i, part := range parts.parts {
 				if !acked[i] {
-					msgr.Debug("sendMessage.06: writing %d bytes to %s", len(part), to.hostId)
+					msgr.Debug(">3> %s/%s(%d) timeout: %s", parts.messageId, parts.messageType, i, timeout)
 					_, err := msgr.WriteToUDP(part, to.UDPAddr)
-					msgr.Debug("sendMessage.07: wrote %d bytes to %s; err = %v", len(part), to.hostId, err)
 					if err != nil {
 						return nil, err
 					}
 				}
 			}
+			timeout = timeout * 2
 		case <-timeoutChan:
-			msgr.Debug("sendMessage.08: timed out")
+			msgr.Debug(">4> %s/%s(%d) timeout: %s", parts.messageId, parts.messageType, 0, timeout)
 			withHost(to, func() {
 				to.state = unresponsive
 			})
@@ -889,6 +863,9 @@ func (h *host) String() string {
 }
 
 func (res *result) String() string {
+	if res == nil {
+		return "[result: nil]"
+	}
 	return fmt.Sprintf("[result: from: %s; %s; body %d]", res.host, res.header, len(res.body))
 }
 

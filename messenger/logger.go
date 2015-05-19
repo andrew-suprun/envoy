@@ -12,7 +12,7 @@ type Logger interface {
 type _defaultLogger struct{}
 
 func (l _defaultLogger) Debug(format string, v ...interface{}) {
-	log.Printf("DEBUG: "+format, v...)
+	// log.Printf("DEBUG: "+format, v...)
 }
 
 func (l _defaultLogger) Info(format string, v ...interface{}) {
