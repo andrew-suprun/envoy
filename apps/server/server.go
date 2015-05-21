@@ -5,11 +5,9 @@ import (
 	"fmt"
 	"github.com/andrew-suprun/envoy/messenger"
 	"log"
-	"math/rand"
 	"runtime"
 	"strings"
 	"sync/atomic"
-	"time"
 )
 
 var localAddrFlag = flag.String("local", "127.0.0.1:55555", "Local address to bind to.")
@@ -46,7 +44,7 @@ func handler(topic string, body []byte) []byte {
 	if c%10000 == 0 {
 		log.Println(c)
 	}
-	time.Sleep(time.Duration(rand.Intn(5000)+2000) * time.Millisecond)
+	// time.Sleep(time.Duration(rand.Intn(5000)+2000) * time.Millisecond)
 	return result
 }
 

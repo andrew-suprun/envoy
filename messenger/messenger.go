@@ -178,39 +178,32 @@ func newMessenger() Messenger {
 }
 
 func (msgr *messenger) Join(local string, remotes []string) (err error) {
-	msgr.Debug("Join: 01")
 	msgr.TCPAddr, err = net.ResolveTCPAddr("tcp", local)
 	if err != nil {
 		return err
 	}
 	// localHost := hostId(msgr.TCPAddr.String())
 
-	msgr.Debug("Join: 02")
 	msgr.TCPListener, err = net.ListenTCP("tcp", msgr.TCPAddr)
 	if err != nil {
 		return err
 	}
 	msgr.Info("Listening on: %s", local)
 
-	msgr.Debug("Join: 03")
 	if len(remotes) > 0 {
 		n := joinRemotes(msgr, remotes)
-		msgr.Debug("Join: joined %d peers", n)
 
 		if len(remotes) > 0 && n == 0 {
 			return FailedToJoinError
 		}
 	}
-	msgr.Debug("Join: 04")
 
 	go acceptConnections(msgr)
 
-	msgr.Debug("Join: 05")
 	return
 }
 
 func joinRemotes(msgr *messenger, remotes []string) int {
-	msgr.Debug("joinRemotes: %s", remotes)
 	toJoinChan := make(chan hostId, len(remotes))
 	sentInvitations := make(map[hostId]struct{})
 	var (
@@ -230,7 +223,6 @@ func joinRemotes(msgr *messenger, remotes []string) int {
 
 	go func() {
 		for invitation := range toJoinChan {
-			msgr.Debug("send invitation to %s", invitation)
 			raddr, err := net.ResolveTCPAddr("tcp", string(invitation))
 			if err != nil {
 				msgr.Info("Failed to resolve address %s (%v). Ignoring.", invitation, err)
@@ -242,16 +234,12 @@ func joinRemotes(msgr *messenger, remotes []string) int {
 			sentInvitations[hostId(invitation)] = struct{}{}
 			invitationMutex.Unlock()
 
-			msgr.Debug("connecting to %s", raddr)
 			conn, err := net.DialTCP("tcp", nil, raddr)
-			msgr.Debug("connected to %s: %v", raddr, err)
 			if err != nil {
 				msgr.Error("Failed to connect to %s: %v", invitation, err)
 				return
 			}
-			msgr.Debug("joining %s", conn.RemoteAddr())
 			host := join(msgr, conn)
-			msgr.Debug("joined %s", host.hostId)
 			if host != nil {
 				resultChan <- host
 			}
@@ -318,16 +306,13 @@ func newJoinMessage(msgr *messenger) *message {
 }
 
 func join(msgr *messenger, conn *net.TCPConn) *host {
-	msgr.Debug("join: conn = %s", conn.RemoteAddr())
 	joinMsg := newJoinMessage(msgr)
 	err := writeMessage(msgr, conn, joinMsg)
-	msgr.Debug("join: wrote message = %s: %v", joinMsg, err)
 	if err != nil {
 		msgr.Error("Failed to write join request to %s: %v", conn.RemoteAddr(), err)
 		return nil
 	}
 	joinReplyMsg, err := readMessage(msgr, conn)
-	msgr.Debug("join: read message = %s: %v", joinReplyMsg, err)
 	if err != nil {
 		msgr.Error("Failed to read join reply from %s: %v", conn.RemoteAddr(), err)
 		return nil
@@ -338,7 +323,6 @@ func join(msgr *messenger, conn *net.TCPConn) *host {
 	buf := bytes.NewBuffer(joinReplyMsg.Body)
 	reply := &joinMessageBody{}
 	decode(buf, reply)
-	msgr.Debug("join: reply = %+v", reply)
 
 	host.peers = reply.Peers
 	host.topics = reply.Topics
@@ -349,7 +333,6 @@ func join(msgr *messenger, conn *net.TCPConn) *host {
 
 	go readLoop(msgr, host)
 
-	msgr.Info("Connected to %s", conn.RemoteAddr())
 	return host
 }
 
@@ -405,15 +388,12 @@ func putUint32(b []byte, v uint32) {
 }
 
 func acceptConnections(msgr *messenger) {
-	msgr.Debug("accepting connections")
 	for {
 		conn, err := msgr.TCPListener.AcceptTCP()
-		msgr.Debug("accepted connection from %s; err = %v", conn.RemoteAddr(), err)
 		if err != nil {
 			msgr.Error("Failed to accept connection")
 		} else {
-			host := join(msgr, conn)
-			msgr.Debug("joined %s", host.hostId)
+			join(msgr, conn)
 		}
 	}
 }
@@ -422,7 +402,11 @@ func readLoop(msgr *messenger, host *host) {
 	for {
 		msg, err := readMessage(msgr, host.TCPConn)
 		if err != nil {
-			msgr.Error("Failed to read from %s: %v. Disconnecting.", host.hostId, err)
+			if err.Error() == "EOF" {
+				msgr.Info("Peer %s disconnected.", host.hostId)
+			} else {
+				msgr.Error("Failed to read from %s: %v. Disconnecting.", host.hostId, err)
+			}
 			host.TCPConn.Close()
 			withPeers(msgr, func(hosts hosts) {
 				delete(hosts, host.hostId)

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"github.com/andrew-suprun/envoy/messenger"
 	"log"
-	"math/rand"
 	"os"
 	"runtime"
 	"strings"
@@ -14,7 +13,8 @@ import (
 	"time"
 )
 
-const threads = 10000
+const threads = 100000
+const duration = 5 * time.Second
 
 var localAddrFlag = flag.String("local", "", "Local address.")
 var remoteAddrFlag = flag.String("remotes", "", "Comma separated remote addresses.")
@@ -31,7 +31,7 @@ func main() {
 	log.SetFlags(log.Lmicroseconds)
 	start := time.Now()
 	flag.Parse()
-	time.AfterFunc(time.Minute, func() {
+	time.AfterFunc(duration, func() {
 		done = true
 	})
 	run()
@@ -66,11 +66,11 @@ func run() {
 				}
 				logError(err)
 				// fmt.Printf("%s: %f\n", string(result), time.Now().Sub(start).Seconds())
-				time.Sleep(time.Duration(rand.Intn(100)+100) * time.Microsecond)
+				// time.Sleep(time.Duration(rand.Intn(100)+100) * time.Microsecond)
 			}
 			wg.Done()
 		}(thread)
-		time.Sleep(200 * time.Microsecond)
+		time.Sleep(20 * time.Microsecond)
 	}
 	wg.Wait()
 }
