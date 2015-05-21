@@ -14,11 +14,6 @@ import (
 	"time"
 )
 
-const (
-	DefaultNetworkTimeout = time.Second
-	DefaultPublishTimeout = 30 * time.Second
-)
-
 var (
 	TimeoutError       = errors.New("timed out")
 	NoSubscribersError = errors.New("no subscribers")
@@ -40,19 +35,19 @@ func NewMessenger() Messenger {
 }
 
 type Messenger interface {
-	Join(local string, remotes []string) error
+	Join(local string, remotes []string, timeout time.Duration) error // todo local address
 	Leave()
 
-	Publish(topic string, body []byte) ([]byte, error)
-	Broadcast(topic string, body []byte) ([][]byte, error)
+	Request(topic string, body []byte, timeout time.Duration) ([]byte, error)
+	Survey(topic string, body []byte, timeout time.Duration) ([][]byte, error)
+	Publish(topic string, body []byte) error
+	Broadcast(topic string, body []byte) error
 
 	// No more then one subscription per topic.
 	// Second subscription panics.
 	Subscribe(topic string, handler Handler) error
 	Unsubscribe(topic string) error
 
-	SetNetworkTimeout(timeout time.Duration)
-	SetPublishTimeout(timeout time.Duration)
 	SetLogger(logger Logger)
 }
 
@@ -103,8 +98,6 @@ type (
 		Logger
 		subscriptions
 		peers
-		networkTimeout time.Duration
-		publishTimeout time.Duration
 	}
 
 	peers struct {
@@ -169,15 +162,13 @@ func withHost(host *host, f func()) {
 
 func newMessenger() Messenger {
 	return &messenger{
-		networkTimeout: DefaultNetworkTimeout,
-		publishTimeout: DefaultPublishTimeout,
-		Logger:         defaultLogger,
-		subscriptions:  subscriptions{handlers: make(handlers)},
-		peers:          peers{hosts: make(hosts)},
+		Logger:        defaultLogger,
+		subscriptions: subscriptions{handlers: make(handlers)},
+		peers:         peers{hosts: make(hosts)},
 	}
 }
 
-func (msgr *messenger) Join(local string, remotes []string) (err error) {
+func (msgr *messenger) Join(local string, remotes []string, timeout time.Duration) (err error) {
 	msgr.TCPAddr, err = net.ResolveTCPAddr("tcp", local)
 	if err != nil {
 		return err
@@ -191,7 +182,7 @@ func (msgr *messenger) Join(local string, remotes []string) (err error) {
 	msgr.Info("Listening on: %s", local)
 
 	if len(remotes) > 0 {
-		n := joinRemotes(msgr, remotes)
+		n := joinRemotes(msgr, remotes, timeout)
 
 		if len(remotes) > 0 && n == 0 {
 			return FailedToJoinError
@@ -203,7 +194,8 @@ func (msgr *messenger) Join(local string, remotes []string) (err error) {
 	return
 }
 
-func joinRemotes(msgr *messenger, remotes []string) int {
+func joinRemotes(msgr *messenger, remotes []string, timeout time.Duration) int {
+	msgr.Debug("joinRemotes: remotes %s", remotes)
 	toJoinChan := make(chan hostId, len(remotes))
 	sentInvitations := make(map[hostId]struct{})
 	var (
@@ -218,11 +210,12 @@ func joinRemotes(msgr *messenger, remotes []string) int {
 
 	atomic.AddInt64(&sent, int64(len(remotes)))
 
-	timeoutChan := time.After(msgr.networkTimeout)
+	timeoutChan := time.After(timeout)
 	resultChan := make(chan *host)
 
 	go func() {
 		for invitation := range toJoinChan {
+			msgr.Debug("joinRemotes: invitation '%s'", invitation)
 			raddr, err := net.ResolveTCPAddr("tcp", string(invitation))
 			if err != nil {
 				msgr.Info("Failed to resolve address %s (%v). Ignoring.", invitation, err)
@@ -249,6 +242,7 @@ func joinRemotes(msgr *messenger, remotes []string) int {
 	localHost := hostId(msgr.TCPAddr.String())
 	done := false
 	for !done {
+		msgr.Debug("joinRemotes: for")
 		select {
 		case result := <-resultChan:
 			msgr.Info("Joined %s", result.hostId)
@@ -306,6 +300,7 @@ func newJoinMessage(msgr *messenger) *message {
 }
 
 func join(msgr *messenger, conn *net.TCPConn) *host {
+	msgr.Debug("join: conn %s", conn.RemoteAddr())
 	joinMsg := newJoinMessage(msgr)
 	err := writeMessage(msgr, conn, joinMsg)
 	if err != nil {
@@ -487,7 +482,23 @@ func (msgr *messenger) Unsubscribe(_topic string) error {
 	return nil
 }
 
-func (msgr *messenger) Publish(_topic string, body []byte) ([]byte, error) {
+func (msgr *messenger) Publish(_topic string, body []byte) error {
+	to := selectHost(msgr, topic(_topic))
+	if to == nil {
+		return NoSubscribersError
+	}
+
+	msg := &message{
+		MessageId:   newId(),
+		MessageType: request,
+		Topic:       _topic,
+		Body:        body,
+	}
+
+	return writeMessage(msgr, to.TCPConn, msg)
+}
+
+func (msgr *messenger) Request(_topic string, body []byte, timeout time.Duration) ([]byte, error) {
 	to := selectHost(msgr, topic(_topic))
 	if to == nil {
 		return []byte{}, NoSubscribersError
@@ -501,20 +512,20 @@ func (msgr *messenger) Publish(_topic string, body []byte) ([]byte, error) {
 	}
 
 	replyChan := make(chan *message)
-	var s int
 	withHost(to, func() {
 		to.pendingReplies[msg.MessageId] = replyChan
-		s = len(to.pendingReplies)
 	})
 
 	err := writeMessage(msgr, to.TCPConn, msg)
 
 	reply := &message{}
 	if err == nil {
-		select {
-		case <-time.After(msgr.publishTimeout):
-			err = TimeoutError
-		case reply = <-replyChan:
+		if err == nil {
+			select {
+			case <-time.After(timeout):
+				err = TimeoutError
+			case reply = <-replyChan:
+			}
 		}
 	}
 
@@ -550,16 +561,12 @@ func selectHost(msgr *messenger, t topic) (peer *host) {
 	return peer
 }
 
-func (msgr *messenger) Broadcast(topic string, body []byte) ([][]byte, error) {
+func (msgr *messenger) Broadcast(topic string, body []byte) error {
+	return nil
+}
+
+func (msgr *messenger) Survey(topic string, body []byte, timeout time.Duration) ([][]byte, error) {
 	return nil, nil
-}
-
-func (msgr *messenger) SetNetworkTimeout(timeout time.Duration) {
-	msgr.networkTimeout = timeout
-}
-
-func (msgr *messenger) SetPublishTimeout(timeout time.Duration) {
-	msgr.publishTimeout = timeout
 }
 
 func (msgr *messenger) SetLogger(logger Logger) {

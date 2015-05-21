@@ -42,23 +42,21 @@ func run() {
 	msgr := messenger.NewMessenger()
 	remotes := strings.Split(*remoteAddrFlag, ",")
 	if len(remotes) > 0 {
-		err := msgr.Join(*localAddrFlag, remotes)
+		err := msgr.Join(*localAddrFlag, remotes, time.Second)
 		if err != nil {
 			fmt.Printf("Failed to join. Exiting\n")
 			os.Exit(1)
 		}
 	}
 
+	buf := make([]byte, 100*1024)
 	wg.Add(threads)
 	for i := 1; i <= threads; i++ {
 		thread := i
 		go func(thread int) {
 			for job := 1; !done; job++ {
-				out := fmt.Sprintf("--- %s: thread #%d job #%d ---", *localAddrFlag, thread, job)
-				outBuf := []byte(out)
-				// start := time.Now()
-				result, err := msgr.Publish("job", outBuf)
-				_ = result
+				// err := msgr.Publish("job", buf)
+				_, err := msgr.Request("job", buf, 10*time.Second)
 				if err == nil {
 					atomic.AddInt64(&okCount, 1)
 				} else {
