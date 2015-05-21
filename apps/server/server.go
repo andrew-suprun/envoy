@@ -41,7 +41,7 @@ var count int64
 func handler(topic string, body []byte) []byte {
 	c := atomic.AddInt64(&count, 1)
 	// result := append([]byte(fmt.Sprintf("[%d]: ", c)), body...)
-	if c%100 == 0 {
+	if c%1000 == 0 {
 		log.Println(c)
 	}
 	// time.Sleep(time.Duration(rand.Intn(5000)+2000) * time.Millisecond)
