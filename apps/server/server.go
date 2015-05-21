@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"github.com/andrew-suprun/envoy/messenger"
 	"log"
+	"math/rand"
 	"runtime"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
 var localAddrFlag = flag.String("local", "127.0.0.1:55555", "Local address to bind to.")
@@ -27,7 +30,7 @@ func main() {
 		remotes = strings.Split(*remoteAddrFlag, ",")
 	}
 
-	_, err = msgr.Join(*localAddrFlag, remotes)
+	err = msgr.Join(*localAddrFlag, remotes)
 	if err != nil {
 		log.Printf("Error: %v", err)
 	}
@@ -35,9 +38,15 @@ func main() {
 	select {}
 }
 
+var count int64
+
 func handler(topic string, body []byte) []byte {
-	result := append([]byte("Received "), body...)
-	fmt.Println(string(result))
+	c := atomic.AddInt64(&count, 1)
+	result := append([]byte(fmt.Sprintf("[%d]: ", c)), body...)
+	if c%10000 == 0 {
+		log.Println(c)
+	}
+	time.Sleep(time.Duration(rand.Intn(5000)+2000) * time.Millisecond)
 	return result
 }
 
