@@ -22,7 +22,7 @@ var (
 
 type PanicError struct {
 	MessageId string
-	At        *net.TCPAddr
+	At        net.Addr
 	Stack     []byte
 }
 
@@ -93,8 +93,8 @@ type (
 	state          int
 
 	messenger struct {
-		*net.TCPAddr
-		*net.TCPListener
+		net.Addr
+		net.Listener
 		Logger
 		subscriptions
 		peers
@@ -108,8 +108,8 @@ type (
 	host struct {
 		sync.Mutex
 		hostId
-		*net.TCPAddr
-		*net.TCPConn
+		net.Addr
+		net.Conn
 		state
 		pendingReplies
 		peers  map[hostId]state
@@ -146,10 +146,10 @@ func withPeers(msgr *messenger, f func(hosts)) {
 	f(msgr.peers.hosts)
 }
 
-func newHost(conn *net.TCPConn) *host {
+func newHost(conn net.Conn) *host {
 	return &host{
 		hostId:         hostId(conn.RemoteAddr().String()),
-		TCPConn:        conn,
+		Conn:           conn,
 		pendingReplies: make(pendingReplies),
 	}
 }
@@ -169,16 +169,11 @@ func newMessenger() Messenger {
 }
 
 func (msgr *messenger) Join(local string, remotes []string, timeout time.Duration) (err error) {
-	msgr.TCPAddr, err = net.ResolveTCPAddr("tcp", local)
+	msgr.Listener, err = net.Listen("tcp", local)
 	if err != nil {
 		return err
 	}
-	// localHost := hostId(msgr.TCPAddr.String())
-
-	msgr.TCPListener, err = net.ListenTCP("tcp", msgr.TCPAddr)
-	if err != nil {
-		return err
-	}
+	msgr.Addr = msgr.Listener.Addr()
 	msgr.Info("Listening on: %s", local)
 
 	if len(remotes) > 0 {
@@ -216,18 +211,12 @@ func joinRemotes(msgr *messenger, remotes []string, timeout time.Duration) int {
 	go func() {
 		for invitation := range toJoinChan {
 			msgr.Debug("joinRemotes: invitation '%s'", invitation)
-			raddr, err := net.ResolveTCPAddr("tcp", string(invitation))
-			if err != nil {
-				msgr.Info("Failed to resolve address %s (%v). Ignoring.", invitation, err)
-				return
-			}
-			invitation = hostId(raddr.String())
 
 			invitationMutex.Lock()
 			sentInvitations[hostId(invitation)] = struct{}{}
 			invitationMutex.Unlock()
 
-			conn, err := net.DialTCP("tcp", nil, raddr)
+			conn, err := net.Dial("tcp", string(invitation))
 			if err != nil {
 				msgr.Error("Failed to connect to %s: %v", invitation, err)
 				return
@@ -239,7 +228,7 @@ func joinRemotes(msgr *messenger, remotes []string, timeout time.Duration) int {
 		}
 	}()
 
-	localHost := hostId(msgr.TCPAddr.String())
+	localHost := hostId(msgr.Addr.String())
 	done := false
 	for !done {
 		msgr.Debug("joinRemotes: for")
@@ -299,7 +288,7 @@ func newJoinMessage(msgr *messenger) *message {
 	return &message{MessageId: newId(), MessageType: joinMessage, Body: buf.Bytes()}
 }
 
-func join(msgr *messenger, conn *net.TCPConn) *host {
+func join(msgr *messenger, conn net.Conn) *host {
 	msgr.Debug("join: conn %s", conn.RemoteAddr())
 	joinMsg := newJoinMessage(msgr)
 	err := writeMessage(msgr, conn, joinMsg)
@@ -331,7 +320,7 @@ func join(msgr *messenger, conn *net.TCPConn) *host {
 	return host
 }
 
-func readMessage(msgr *messenger, from *net.TCPConn) (*message, error) {
+func readMessage(msgr *messenger, from net.Conn) (*message, error) {
 	lenBuf := make([]byte, 4)
 	readBuf := lenBuf
 
@@ -359,7 +348,7 @@ func readMessage(msgr *messenger, from *net.TCPConn) (*message, error) {
 	return msg, nil
 }
 
-func writeMessage(msgr *messenger, to *net.TCPConn, msg *message) error {
+func writeMessage(msgr *messenger, to net.Conn, msg *message) error {
 	buf := bytes.NewBuffer(make([]byte, 4, 128))
 	encode(msg, buf)
 	bufSize := buf.Len()
@@ -384,7 +373,7 @@ func putUint32(b []byte, v uint32) {
 
 func acceptConnections(msgr *messenger) {
 	for {
-		conn, err := msgr.TCPListener.AcceptTCP()
+		conn, err := msgr.Listener.Accept()
 		if err != nil {
 			msgr.Error("Failed to accept connection")
 		} else {
@@ -395,14 +384,14 @@ func acceptConnections(msgr *messenger) {
 
 func readLoop(msgr *messenger, host *host) {
 	for {
-		msg, err := readMessage(msgr, host.TCPConn)
+		msg, err := readMessage(msgr, host.Conn)
 		if err != nil {
 			if err.Error() == "EOF" {
 				msgr.Info("Peer %s disconnected.", host.hostId)
 			} else {
 				msgr.Error("Failed to read from %s: %v. Disconnecting.", host.hostId, err)
 			}
-			host.TCPConn.Close()
+			host.Conn.Close()
 			withPeers(msgr, func(hosts hosts) {
 				delete(hosts, host.hostId)
 			})
@@ -437,7 +426,7 @@ func handleRequest(msgr *messenger, host *host, msg *message) {
 		MessageType: reply,
 		Body:        result,
 	}
-	err := writeMessage(msgr, host.TCPConn, reply)
+	err := writeMessage(msgr, host.Conn, reply)
 	if err != nil {
 		msgr.Error("Failed to reply to %s: %v.", host.hostId, err)
 	}
@@ -465,7 +454,7 @@ func (msgr *messenger) Subscribe(_topic string, handler Handler) error {
 		handlers[topic(_topic)] = handler
 	})
 
-	if msgr.TCPListener != nil {
+	if msgr.Listener != nil {
 		// TODO: broadcast subscribe message
 	}
 	return nil
@@ -476,7 +465,7 @@ func (msgr *messenger) Unsubscribe(_topic string) error {
 		delete(handlers, topic(_topic))
 	})
 
-	if msgr.TCPListener != nil {
+	if msgr.Listener != nil {
 		// TODO: broadcast unsubscribe message
 	}
 	return nil
@@ -495,7 +484,7 @@ func (msgr *messenger) Publish(_topic string, body []byte) error {
 		Body:        body,
 	}
 
-	return writeMessage(msgr, to.TCPConn, msg)
+	return writeMessage(msgr, to.Conn, msg)
 }
 
 func (msgr *messenger) Request(_topic string, body []byte, timeout time.Duration) ([]byte, error) {
@@ -516,7 +505,7 @@ func (msgr *messenger) Request(_topic string, body []byte, timeout time.Duration
 		to.pendingReplies[msg.MessageId] = replyChan
 	})
 
-	err := writeMessage(msgr, to.TCPConn, msg)
+	err := writeMessage(msgr, to.Conn, msg)
 
 	reply := &message{}
 	if err == nil {
