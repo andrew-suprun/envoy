@@ -14,7 +14,7 @@ import (
 )
 
 const threads = 1000
-const msgSize = 1 * 1024
+const msgSize = 10 // * 1024
 const duration = 10 * time.Second
 
 var localAddrFlag = flag.String("local", "", "Local address.")
@@ -71,10 +71,11 @@ func run() {
 		thread := i
 		go func(thread int) {
 			for job := 1; !done; job++ {
-				// err := msgr.Publish("job", buf)
-
 				start := time.Now()
-				_, err := msgr.Request("job", buf, 30*time.Second)
+
+				err := msgr.Publish("job", buf)
+				// _, err := msgr.Request("job", buf, 30*time.Second)
+
 				duration := time.Now().Sub(start)
 				maxDurationMutex.Lock()
 				totalDurations += duration
@@ -88,8 +89,6 @@ func run() {
 					atomic.AddInt64(&errCount, 1)
 				}
 				logError(err)
-				// fmt.Printf("%s: %f\n", string(result), time.Now().Sub(start).Seconds())
-				// time.Sleep(time.Duration(rand.Intn(100)+100) * time.Microsecond)
 			}
 			wg.Done()
 		}(thread)
