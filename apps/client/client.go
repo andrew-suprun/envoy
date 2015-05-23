@@ -13,9 +13,9 @@ import (
 	"time"
 )
 
-const threads = 1000
-const msgSize = 10 // * 1024
-const duration = 10 * time.Second
+const threads = 10000
+const msgSize = 50 * 1024
+const duration = 20 * time.Second
 
 var localAddrFlag = flag.String("local", "", "Local address.")
 var remoteAddrFlag = flag.String("remotes", "", "Comma separated remote addresses.")
@@ -57,6 +57,7 @@ func main() {
 func run() {
 	msgr := messenger.NewMessenger()
 	remotes := strings.Split(*remoteAddrFlag, ",")
+	msgr.Subscribe("client1", handler)
 	if len(remotes) > 0 {
 		err := msgr.Join(*localAddrFlag, remotes, time.Second)
 		if err != nil {
@@ -64,6 +65,9 @@ func run() {
 			os.Exit(1)
 		}
 	}
+
+	msgr.Subscribe("client2", handler)
+	msgr.Unsubscribe("client1")
 
 	buf := make([]byte, msgSize)
 	wg.Add(threads)

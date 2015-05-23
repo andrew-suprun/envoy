@@ -1,6 +1,7 @@
 bin
 pkg
 
+*.log
 apps/client/client
 apps/server/server
 apps/test

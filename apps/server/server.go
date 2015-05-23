@@ -44,7 +44,7 @@ func handler(topic string, body []byte) []byte {
 	if c%1000 == 0 {
 		log.Println(c)
 	}
-	// time.Sleep(time.Duration(rand.Intn(5000)+2000) * time.Millisecond)
+	// time.Sleep(time.Duration(rand.Intn(3000)+2000) * time.Millisecond)
 	return body
 }
 
