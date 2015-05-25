@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-var localAddrFlag = flag.String("local", "127.0.0.1:55555", "Local address to bind to.")
-var remoteAddrFlag = flag.String("remotes", "", "Comma separated remote addresses.")
+var localAddrFlag = flag.String("local", "localhost:55555", "Local address to bind to.")
+var remoteAddrFlag = flag.String("remotes", "localhost:44444", "Comma separated remote addresses.")
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
@@ -28,7 +28,7 @@ func main() {
 		remotes = strings.Split(*remoteAddrFlag, ",")
 	}
 
-	err = msgr.Join(*localAddrFlag, remotes, time.Second)
+	err = msgr.Join(*localAddrFlag, time.Second, remotes...)
 	if err != nil {
 		log.Printf("Error: %v", err)
 	}

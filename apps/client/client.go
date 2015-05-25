@@ -17,8 +17,8 @@ const threads = 10000
 const msgSize = 50 * 1024
 const duration = 20 * time.Second
 
-var localAddrFlag = flag.String("local", "", "Local address.")
-var remoteAddrFlag = flag.String("remotes", "", "Comma separated remote addresses.")
+var localAddrFlag = flag.String("local", "localhost:44444", "Local address.")
+var remoteAddrFlag = flag.String("remotes", "localhost:55555", "Comma separated remote addresses.")
 
 var maxDuration time.Duration
 var totalDurations time.Duration
@@ -59,15 +59,12 @@ func run() {
 	remotes := strings.Split(*remoteAddrFlag, ",")
 	msgr.Subscribe("client1", handler)
 	if len(remotes) > 0 {
-		err := msgr.Join(*localAddrFlag, remotes, time.Second)
+		err := msgr.Join(*localAddrFlag, time.Second, remotes...)
 		if err != nil {
 			fmt.Printf("Failed to join. Exiting\n")
 			os.Exit(1)
 		}
 	}
-
-	msgr.Subscribe("client2", handler)
-	msgr.Unsubscribe("client1")
 
 	buf := make([]byte, msgSize)
 	wg.Add(threads)

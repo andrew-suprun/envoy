@@ -11,7 +11,7 @@ type Logger interface {
 type _defaultLogger struct{}
 
 func (l _defaultLogger) Debugf(format string, v ...interface{}) {
-	// log.Printf("DEBUG: "+format, v...)
+	log.Printf("DEBUG: "+format, v...)
 }
 
 func (l _defaultLogger) Infof(format string, v ...interface{}) {

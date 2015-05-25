@@ -275,6 +275,7 @@ func newJoinMessage(msgr *messenger) *message {
 }
 
 func joinPeer(msgr *messenger, conn net.Conn) *host {
+	msgr.Debugf("joinPeer[%s].01: conn = %s", msgr.hostId, conn.RemoteAddr())
 	host := newHost(conn)
 	joinMsg := newJoinMessage(msgr)
 	err := writeMessage(msgr, host, joinMsg)
@@ -299,6 +300,7 @@ func joinPeer(msgr *messenger, conn net.Conn) *host {
 		host.topics[topic] = struct{}{}
 	}
 
+	msgr.Debugf("joinPeer[%s].10: host = %s", msgr.hostId, host)
 	withPeers(msgr, func(hosts hosts) {
 		hosts[host.hostId] = host
 	})
@@ -338,6 +340,7 @@ func readMessage(msgr *messenger, from net.Conn) (*message, error) {
 }
 
 func writeMessage(msgr *messenger, to *host, msg *message) error {
+	msgr.Debugf("writeMessage[%s].01: to = %s; msg = %s", msgr.hostId, to.Conn.RemoteAddr(), msg.MessageType)
 	buf := bytes.NewBuffer(make([]byte, 4, 128))
 	encode(msg, buf)
 	bufSize := buf.Len()
@@ -362,7 +365,7 @@ func putUint32(b []byte, v uint32) {
 }
 
 func acceptConnections(msgr *messenger) {
-	for {
+	for !msgr.closing {
 		conn, err := msgr.Listener.Accept()
 		if err != nil {
 			if msgr.closing {
@@ -370,12 +373,14 @@ func acceptConnections(msgr *messenger) {
 			}
 			msgr.Errorf("Failed to accept connection: %s", err)
 		} else {
+			msgr.Debugf("%s accepted connection from %s", msgr.hostId, conn.RemoteAddr())
 			joinPeer(msgr, conn)
 		}
 	}
 }
 
 func readLoop(msgr *messenger, host *host) {
+	msgr.Debugf("entered read loop: %s from %s", msgr.hostId, host.hostId)
 	for {
 		msg, err := readMessage(msgr, host.Conn)
 		msgr.Debugf("read message: %s", msg)
