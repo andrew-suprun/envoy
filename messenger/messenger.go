@@ -51,7 +51,6 @@ const (
 	publish messageType = iota
 	request
 	reply
-	ack
 	join
 	leave
 	subscribe
@@ -132,13 +131,13 @@ type subscribeMessageBody struct {
 	Topic  topic  `codec:"t,omitempty"`
 }
 
-func withSubscriptions(msgr *messenger, f func(handlers)) {
+func (msgr *messenger) withSubscriptions(f func(handlers)) {
 	msgr.subscriptions.Lock()
 	defer msgr.subscriptions.Unlock()
 	f(msgr.subscriptions.handlers)
 }
 
-func withPeers(msgr *messenger, f func(hosts)) {
+func (msgr *messenger) withPeers(f func(hosts)) {
 	msgr.peers.Mutex.Lock()
 	defer msgr.peers.Unlock()
 	f(msgr.peers.hosts)
@@ -174,14 +173,14 @@ func (msgr *messenger) Join(local string, timeout time.Duration, remotes ...stri
 		return err
 	}
 	msgr.hostId = hostId(msgr.Listener.Addr().String())
-	msgr.Infof("Listening on: %s", local)
+	msgr.Infof("Listening on: %s", msgr.hostId)
 
-	go acceptConnections(msgr)
-	joinPeers(msgr, remotes, timeout)
+	go msgr.acceptConnections()
+	msgr.joinPeers(remotes, timeout)
 	return
 }
 
-func joinPeers(msgr *messenger, remotes []string, timeout time.Duration) int {
+func (msgr *messenger) joinPeers(remotes []string, timeout time.Duration) int {
 	toJoinChan := make(chan hostId, len(remotes))
 	sentInvitations := make(map[hostId]struct{})
 	var (
@@ -191,7 +190,12 @@ func joinPeers(msgr *messenger, remotes []string, timeout time.Duration) int {
 	)
 
 	for _, remote := range remotes {
-		toJoinChan <- hostId(remote)
+		addr, err := net.ResolveTCPAddr("tcp", remote)
+		if err != nil {
+			msgr.Errorf("Failed to resolve '%s'. Ignoring.", remote)
+		} else {
+			toJoinChan <- hostId(addr.String())
+		}
 	}
 
 	atomic.AddInt64(&sent, int64(len(remotes)))
@@ -210,7 +214,7 @@ func joinPeers(msgr *messenger, remotes []string, timeout time.Duration) int {
 				msgr.Errorf("Failed to connect to %s: %v", invitation, err)
 				return
 			}
-			host := joinPeer(msgr, conn)
+			host := msgr.joinPeer(conn)
 			if host != nil {
 				resultChan <- host
 			}
@@ -225,7 +229,7 @@ collectResults:
 				_ = state // TODO: Handle peer state
 				if peer != msgr.hostId {
 					alreadyPresent := false
-					withPeers(msgr, func(hosts hosts) {
+					msgr.withPeers(func(hosts hosts) {
 						_, alreadyPresent = hosts[peer]
 					})
 					if !alreadyPresent {
@@ -253,16 +257,16 @@ collectResults:
 	return int(atomic.LoadInt64(&received))
 }
 
-func newJoinMessage(msgr *messenger) *message {
+func (msgr *messenger) newJoinMessage() *message {
 	var topics []topic
-	withSubscriptions(msgr, func(h handlers) {
+	msgr.withSubscriptions(func(h handlers) {
 		topics = make([]topic, 0, len(h))
 		for topic := range h {
 			topics = append(topics, topic)
 		}
 	})
 	var peers []hostId
-	withPeers(msgr, func(hosts hosts) {
+	msgr.withPeers(func(hosts hosts) {
 		peers = make([]hostId, 0, len(hosts))
 		for _, peer := range hosts {
 			peers = append(peers, peer.hostId)
@@ -274,15 +278,14 @@ func newJoinMessage(msgr *messenger) *message {
 	return &message{MessageId: newId(), MessageType: join, Body: buf.Bytes()}
 }
 
-func joinPeer(msgr *messenger, conn net.Conn) *host {
-	msgr.Debugf("joinPeer[%s].01: conn = %s", msgr.hostId, conn.RemoteAddr())
+func (msgr *messenger) joinPeer(conn net.Conn) *host {
 	host := newHost(conn)
-	joinMsg := newJoinMessage(msgr)
-	err := writeMessage(msgr, host, joinMsg)
+	joinMsg := msgr.newJoinMessage()
+	err := writeMessage(host, joinMsg)
 	if err != nil {
 		return nil
 	}
-	joinReplyMsg, err := readMessage(msgr, conn)
+	joinReplyMsg, err := readMessage(conn)
 	if err != nil {
 		return nil
 	}
@@ -300,18 +303,17 @@ func joinPeer(msgr *messenger, conn net.Conn) *host {
 		host.topics[topic] = struct{}{}
 	}
 
-	msgr.Debugf("joinPeer[%s].10: host = %s", msgr.hostId, host)
-	withPeers(msgr, func(hosts hosts) {
+	msgr.withPeers(func(hosts hosts) {
 		hosts[host.hostId] = host
 	})
 
-	go readLoop(msgr, host)
+	go msgr.readLoop(host)
 
-	msgr.Infof("Joined %s; topics: %s", host.hostId, reply.Topics)
+	msgr.Infof("%s joined by %s; topics: %s", msgr.hostId, host.hostId, reply.Topics)
 	return host
 }
 
-func readMessage(msgr *messenger, from net.Conn) (*message, error) {
+func readMessage(from net.Conn) (*message, error) {
 	lenBuf := make([]byte, 4)
 	readBuf := lenBuf
 
@@ -339,16 +341,14 @@ func readMessage(msgr *messenger, from net.Conn) (*message, error) {
 	return msg, nil
 }
 
-func writeMessage(msgr *messenger, to *host, msg *message) error {
-	msgr.Debugf("writeMessage[%s].01: to = %s; msg = %s", msgr.hostId, to.Conn.RemoteAddr(), msg.MessageType)
+func writeMessage(to net.Conn, msg *message) error {
 	buf := bytes.NewBuffer(make([]byte, 4, 128))
 	encode(msg, buf)
 	bufSize := buf.Len()
 	putUint32(buf.Bytes(), uint32(bufSize-4))
-	n, err := to.Conn.Write(buf.Bytes())
+	n, err := to.Write(buf.Bytes())
 	if err == nil && n != bufSize {
-		msgr.Errorf("Failed to write to %s: %v. Disconnecting.", to.hostId, err)
-		disconnect(msgr, to.hostId)
+		return fmt.Errorf("Failed to write to %s.", to.RemoteAddr())
 	}
 	return err
 }
@@ -364,7 +364,7 @@ func putUint32(b []byte, v uint32) {
 	b[3] = byte(v >> 24)
 }
 
-func acceptConnections(msgr *messenger) {
+func (msgr *messenger) acceptConnections() {
 	for !msgr.closing {
 		conn, err := msgr.Listener.Accept()
 		if err != nil {
@@ -373,44 +373,40 @@ func acceptConnections(msgr *messenger) {
 			}
 			msgr.Errorf("Failed to accept connection: %s", err)
 		} else {
-			msgr.Debugf("%s accepted connection from %s", msgr.hostId, conn.RemoteAddr())
-			joinPeer(msgr, conn)
+			msgr.joinPeer(conn)
 		}
 	}
 }
 
-func readLoop(msgr *messenger, host *host) {
-	msgr.Debugf("entered read loop: %s from %s", msgr.hostId, host.hostId)
+func (msgr *messenger) readLoop(host *host) {
 	for {
-		msg, err := readMessage(msgr, host.Conn)
-		msgr.Debugf("read message: %s", msg)
+		msg, err := readMessage(host.Conn)
 		if err != nil {
 			if err.Error() == "EOF" {
 				msgr.Infof("Peer %s disconnected.", host.hostId)
 			} else {
 				msgr.Errorf("Failed to read from %s: %v. Disconnecting.", host.hostId, err)
 			}
-			disconnect(msgr, host.hostId)
+			msgr.disconnect(host.hostId)
 			return
 		}
 
 		switch msg.MessageType {
 		case publish, request:
-			go handleRequest(msgr, host, msg)
+			go msgr.handleRequest(host, msg)
 		case reply:
-			go handleReply(msgr, host, msg)
+			go msgr.handleReply(host, msg)
 		case subscribe, unsubscribe:
-			go handleSubscription(msgr, host, msg)
+			go msgr.handleSubscription(host, msg)
 		default:
 			panic(fmt.Errorf("Read unknown message type %s", msg.MessageType))
 		}
 	}
 }
 
-func disconnect(msgr *messenger, hostId hostId) {
-	msgr.Debugf("host %s disconnected", hostId)
+func (msgr *messenger) disconnect(hostId hostId) {
 	h, ok := (*host)(nil), false
-	withPeers(msgr, func(hosts hosts) {
+	msgr.withPeers(func(hosts hosts) {
 		h, ok = hosts[hostId]
 		if ok {
 			delete(hosts, h.hostId)
@@ -427,9 +423,9 @@ func disconnect(msgr *messenger, hostId hostId) {
 	})
 }
 
-func handleRequest(msgr *messenger, host *host, msg *message) {
+func (msgr *messenger) handleRequest(host *host, msg *message) {
 	handler, found := Handler(nil), false
-	withSubscriptions(msgr, func(handlers handlers) {
+	msgr.withSubscriptions(func(handlers handlers) {
 		handler, found = handlers[topic(msg.Topic)]
 	})
 
@@ -447,10 +443,10 @@ func handleRequest(msgr *messenger, host *host, msg *message) {
 		MessageType: reply,
 		Body:        result,
 	}
-	writeMessage(msgr, host, reply)
+	writeMessage(host, reply)
 }
 
-func handleReply(msgr *messenger, host *host, msg *message) {
+func (msgr *messenger) handleReply(host *host, msg *message) {
 	pending, found := (chan *pendingReply)(nil), false
 	withHost(host, func() {
 		pending, found = host.pendingReplies[msg.MessageId]
@@ -461,7 +457,7 @@ func handleReply(msgr *messenger, host *host, msg *message) {
 	}
 }
 
-func handleSubscription(msgr *messenger, host *host, msg *message) {
+func (msgr *messenger) handleSubscription(host *host, msg *message) {
 
 	buf := bytes.NewBuffer(msg.Body)
 	var _topic topic
@@ -471,10 +467,8 @@ func handleSubscription(msgr *messenger, host *host, msg *message) {
 		switch msg.MessageType {
 		case subscribe:
 			host.topics[_topic] = struct{}{}
-			msgr.Debugf("%s subscribed to '%s'", host.hostId, _topic)
 		case unsubscribe:
 			delete(host.topics, _topic)
-			msgr.Debugf("%s unsubscribed from '%s'", host.hostId, _topic)
 		default:
 			panic("Wrong message type for handleSubscription")
 		}
@@ -482,36 +476,36 @@ func handleSubscription(msgr *messenger, host *host, msg *message) {
 }
 
 func (msgr *messenger) Leave() {
-	// TODO
 	msgr.closing = true
-	msgr.Debugf("Closing connection")
-	msgr.Listener.Close()
+	if msgr.Listener != nil {
+		msgr.Listener.Close()
+	}
 }
 
 func (msgr *messenger) Subscribe(_topic string, handler Handler) error {
-	withSubscriptions(msgr, func(handlers handlers) {
+	msgr.withSubscriptions(func(handlers handlers) {
 		handlers[topic(_topic)] = handler
 	})
 
-	return broadcastSubscribtion(msgr, _topic, subscribe)
+	return msgr.broadcastSubscribtion(_topic, subscribe)
 }
 
 func (msgr *messenger) Unsubscribe(_topic string) error {
-	withSubscriptions(msgr, func(handlers handlers) {
+	msgr.withSubscriptions(func(handlers handlers) {
 		delete(handlers, topic(_topic))
 	})
 
-	return broadcastSubscribtion(msgr, _topic, unsubscribe)
+	return msgr.broadcastSubscribtion(_topic, unsubscribe)
 }
 
-func broadcastSubscribtion(msgr *messenger, topic string, msgType messageType) error {
+func (msgr *messenger) broadcastSubscribtion(topic string, msgType messageType) error {
 	if msgr.Listener == nil {
 		return nil
 	}
 	buf := &bytes.Buffer{}
 	encode(topic, buf)
 
-	return broadcast(msgr, "", buf.Bytes(), msgType, selectAllHosts(msgr))
+	return msgr.broadcast("", buf.Bytes(), msgType, msgr.selectAllHosts())
 }
 
 func (msgr *messenger) Publish(_topic string, body []byte) error {
@@ -523,20 +517,20 @@ func (msgr *messenger) Publish(_topic string, body []byte) error {
 	}
 
 	for {
-		to := selectTopicHost(msgr, topic(_topic))
+		to := msgr.selectTopicHost(topic(_topic))
 		if to == nil {
 			return NoSubscribersError
 		}
 
-		return writeMessage(msgr, to, msg)
+		return writeMessage(to, msg)
 	}
 }
 
 func (msgr *messenger) Broadcast(_topic string, body []byte) error {
-	return broadcast(msgr, _topic, body, publish, selectAllTopicHosts(msgr, topic(_topic)))
+	return msgr.broadcast(_topic, body, publish, msgr.selectAllTopicHosts(topic(_topic)))
 }
 
-func broadcast(msgr *messenger, _topic string, body []byte, msgType messageType, peers []*host) error {
+func (msgr *messenger) broadcast(_topic string, body []byte, msgType messageType, peers []*host) error {
 	msg := &message{
 		MessageId:   newId(),
 		MessageType: msgType,
@@ -552,7 +546,7 @@ func broadcast(msgr *messenger, _topic string, body []byte, msgType messageType,
 	for _, to := range peers {
 		peer := to
 		go func() {
-			writeMessage(msgr, peer, msg)
+			writeMessage(peer, msg)
 			wg.Done()
 		}()
 	}
@@ -571,7 +565,7 @@ func (msgr *messenger) Request(_topic string, body []byte, timeout time.Duration
 	}
 
 	for {
-		to := selectTopicHost(msgr, topic(_topic))
+		to := msgr.selectTopicHost(topic(_topic))
 		if to == nil {
 			return []byte{}, NoSubscribersError
 		}
@@ -581,7 +575,7 @@ func (msgr *messenger) Request(_topic string, body []byte, timeout time.Duration
 			to.pendingReplies[msg.MessageId] = replyChan
 		})
 
-		err := writeMessage(msgr, to, msg)
+		err := writeMessage(to, msg)
 
 		if err == nil {
 			select {
@@ -616,16 +610,16 @@ func (msgr *messenger) Request(_topic string, body []byte, timeout time.Duration
 	}
 }
 
-func selectTopicHost(msgr *messenger, t topic) (peer *host) {
-	peers := selectAllTopicHosts(msgr, t)
+func (msgr *messenger) selectTopicHost(t topic) (peer *host) {
+	peers := msgr.selectAllTopicHosts(t)
 	if len(peers) == 0 {
 		return nil
 	}
 	return peers[mRand.Intn(len(peers))]
 }
 
-func selectAllTopicHosts(msgr *messenger, t topic) (result []*host) {
-	withPeers(msgr, func(hosts hosts) {
+func (msgr *messenger) selectAllTopicHosts(t topic) (result []*host) {
+	msgr.withPeers(func(hosts hosts) {
 		peers := ([]*host)(nil)
 		for _, host := range hosts {
 			if _, ok := host.topics[t]; ok {
@@ -637,8 +631,8 @@ func selectAllTopicHosts(msgr *messenger, t topic) (result []*host) {
 	return result
 }
 
-func selectAllHosts(msgr *messenger) (result []*host) {
-	withPeers(msgr, func(hosts hosts) {
+func (msgr *messenger) selectAllHosts() (result []*host) {
+	msgr.withPeers(func(hosts hosts) {
 		peers := ([]*host)(nil)
 		for _, host := range hosts {
 			peers = append(peers, host)
@@ -680,8 +674,6 @@ func (mType messageType) String() string {
 	switch mType {
 	case request:
 		return "request"
-	case ack:
-		return "ack"
 	case reply:
 		return "reply"
 	case join:

@@ -9,7 +9,7 @@ import (
 )
 
 func Benchmark1(b *testing.B) {
-	log.Println("---Benchmark---")
+	log.Println("--- Benchmark ---")
 	var c int64
 	defer func() {
 		log.Println("count", c)
@@ -51,10 +51,6 @@ func Benchmark1(b *testing.B) {
 			}
 		}
 	})
-}
-
-func echo(topic string, body []byte) []byte {
-	return body
 }
 
 func init() {
