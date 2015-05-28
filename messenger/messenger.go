@@ -20,10 +20,6 @@ var (
 	FailedToJoinError  = errors.New("failed to join")
 )
 
-func NewMessenger() Messenger {
-	return newMessenger()
-}
-
 type Messenger interface {
 	Join(local string, timeout time.Duration, remotes ...string) error
 	Leave()
@@ -85,12 +81,19 @@ type messenger struct {
 	Logger
 	subscriptions
 	peers
-	closing bool
+	pendingReconnects
+	testReadMessage func(conn net.Conn)
+	closing         bool
 }
 
 type subscriptions struct {
 	sync.Mutex
 	handlers
+}
+
+type pendingReconnects struct {
+	sync.Mutex
+	hosts map[hostId]struct{}
 }
 
 type peers struct {
@@ -131,10 +134,26 @@ type subscribeMessageBody struct {
 	Topic  topic  `codec:"t,omitempty"`
 }
 
+func NewMessenger() Messenger {
+	return &messenger{
+		Logger:            defaultLogger,
+		subscriptions:     subscriptions{handlers: make(handlers)},
+		peers:             peers{hosts: make(hosts)},
+		pendingReconnects: pendingReconnects{hosts: map[hostId]struct{}{}},
+		testReadMessage:   func(conn net.Conn) {},
+	}
+}
+
 func (msgr *messenger) withSubscriptions(f func(handlers)) {
 	msgr.subscriptions.Lock()
 	defer msgr.subscriptions.Unlock()
 	f(msgr.subscriptions.handlers)
+}
+
+func (msgr *messenger) withReconnects(f func(map[hostId]struct{})) {
+	msgr.pendingReconnects.Lock()
+	defer msgr.pendingReconnects.Unlock()
+	f(msgr.pendingReconnects.hosts)
 }
 
 func (msgr *messenger) withPeers(f func(hosts)) {
@@ -159,14 +178,6 @@ func withHost(host *host, f func()) {
 	f()
 }
 
-func newMessenger() Messenger {
-	return &messenger{
-		Logger:        defaultLogger,
-		subscriptions: subscriptions{handlers: make(handlers)},
-		peers:         peers{hosts: make(hosts)},
-	}
-}
-
 func (msgr *messenger) Join(local string, timeout time.Duration, remotes ...string) (err error) {
 	msgr.Listener, err = net.Listen("tcp", local)
 	if err != nil {
@@ -176,6 +187,7 @@ func (msgr *messenger) Join(local string, timeout time.Duration, remotes ...stri
 	msgr.Infof("Listening on: %s", msgr.hostId)
 
 	go msgr.acceptConnections()
+	go msgr.reconnects()
 	msgr.joinPeers(remotes, timeout)
 	return
 }
@@ -279,6 +291,7 @@ func (msgr *messenger) newJoinMessage() *message {
 }
 
 func (msgr *messenger) joinPeer(conn net.Conn) *host {
+	msgr.Debugf("[%s]: joinPeer %s", msgr.hostId, conn.RemoteAddr())
 	host := newHost(conn)
 	joinMsg := msgr.newJoinMessage()
 	err := writeMessage(host, joinMsg)
@@ -303,10 +316,21 @@ func (msgr *messenger) joinPeer(conn net.Conn) *host {
 		host.topics[topic] = struct{}{}
 	}
 
-	msgr.withPeers(func(hosts hosts) {
-		hosts[host.hostId] = host
-	})
+	msgr.Debugf("[%s]: joinPeer: got reply %s", msgr.hostId, host)
 
+	var alreadyExist bool
+	msgr.withPeers(func(hosts hosts) {
+		_, alreadyExist := hosts[host.hostId]
+		if !alreadyExist {
+			hosts[host.hostId] = host
+		}
+	})
+	if alreadyExist {
+		msgr.Debugf("[%s]: %s already exist", msgr.hostId, host.hostId)
+		return nil
+	}
+
+	msgr.Debugf("[%s]: joinPeer: entering read loop %s", msgr.hostId, host.hostId)
 	go msgr.readLoop(host)
 
 	msgr.Infof("%s joined by %s; topics: %s", msgr.hostId, host.hostId, reply.Topics)
@@ -378,14 +402,49 @@ func (msgr *messenger) acceptConnections() {
 	}
 }
 
+var reconnectInterval = 10 * time.Second
+
+func (msgr *messenger) reconnects() {
+	for !msgr.closing {
+		time.Sleep(reconnectInterval)
+		pending := []hostId{}
+		msgr.withReconnects(func(hosts map[hostId]struct{}) {
+			for hostId := range hosts {
+				pending = append(pending, hostId)
+			}
+		})
+		for _, _hostId := range pending {
+			var _host *host
+			var exist bool
+			msgr.withPeers(func(peers hosts) {
+				_host, exist = peers[_hostId]
+			})
+			if !exist {
+				conn, err := net.Dial("tcp", string(_hostId))
+				msgr.Debugf("reconnect[%s]: dialed to %s; err = %v", msgr.hostId, conn.RemoteAddr(), err)
+				if err != nil {
+					continue
+				}
+				_host = msgr.joinPeer(conn)
+			}
+			if _host != nil {
+				msgr.withReconnects(func(hosts map[hostId]struct{}) {
+					delete(hosts, _hostId)
+				})
+			}
+		}
+	}
+}
+
 func (msgr *messenger) readLoop(host *host) {
 	for {
+		msgr.testReadMessage(host.Conn)
 		msg, err := readMessage(host.Conn)
 		if err != nil {
 			if err.Error() == "EOF" {
 				msgr.Infof("Peer %s disconnected.", host.hostId)
 			} else {
-				msgr.Errorf("Failed to read from %s: %v. Disconnecting.", host.hostId, err)
+				msgr.Errorf("Messenger[%s]: Failed to read from %s: %v. Disconnecting.", msgr.hostId, host.hostId, err)
 			}
 			msgr.disconnect(host.hostId)
 			return
@@ -420,6 +479,13 @@ func (msgr *messenger) disconnect(hostId hostId) {
 		for _, prChan := range h.pendingReplies {
 			prChan <- &pendingReply{replyCode: disconnected}
 		}
+	})
+	msgr.reconnect(hostId)
+}
+
+func (msgr *messenger) reconnect(_hostId hostId) {
+	msgr.withReconnects(func(hosts map[hostId]struct{}) {
+		hosts[_hostId] = struct{}{}
 	})
 }
 

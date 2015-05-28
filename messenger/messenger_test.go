@@ -2,6 +2,7 @@ package messenger
 
 import (
 	"log"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -51,11 +52,19 @@ func TestTwoOnTwo(t *testing.T) {
 	defer client2.Leave()
 	client2.Join("localhost:40001", time.Second, "localhost:50000")
 
+	c := 0
+	server2.(*messenger).testReadMessage = func(conn net.Conn) {
+		c++
+		if c > 10 {
+			conn.Close()
+		}
+	}
+
 	c1s1, c1s2, c2s1, c2s2 := 0, 0, 0, 0
 	wg := sync.WaitGroup{}
 	wg.Add(2)
 	go func() {
-		for i := 0; i < 20; i++ {
+		for i := 0; i < 100; i++ {
 			reply, err := client1.Request("job", []byte("Hello1"), time.Second)
 			rep := string(reply)
 			if err != nil {
@@ -76,7 +85,7 @@ func TestTwoOnTwo(t *testing.T) {
 	}()
 
 	go func() {
-		for i := 0; i < 20; i++ {
+		for i := 0; i < 100; i++ {
 			reply, err := client2.Request("job", []byte("Hello2"), time.Second)
 			rep := string(reply)
 			if err != nil {
@@ -97,7 +106,85 @@ func TestTwoOnTwo(t *testing.T) {
 	}()
 	wg.Wait()
 	log.Printf("counts: c1s1: %d, c1s2: %d, c2s1: %d, c2s2: %d", c1s1, c1s2, c2s1, c2s2)
-	if c1s1 == 0 || c1s2 == 0 || c2s1 == 0 || c2s2 == 0 || c1s1+c1s2 != 20 || c2s1+c2s2 != 20 {
+	if c1s1 == 0 || c1s2 == 0 || c2s1 == 0 || c2s2 == 0 || c1s1+c1s2 != 100 || c2s1+c2s2 != 100 || c1s2+c2s2 != 10 {
+		t.Errorf("Wrong counts")
+	}
+}
+
+func TestReconnect(t *testing.T) {
+	log.Println("---------------- TestReconnect ----------------")
+
+	reconnectInterval = 200 * time.Millisecond
+
+	server1 := NewMessenger()
+	defer server1.Leave()
+	server1.Subscribe("job", echo1)
+	server1.Join("localhost:50000", time.Second)
+
+	server2 := NewMessenger()
+	defer server2.Leave()
+	server2.Subscribe("job", echo2)
+	server2.Join("localhost:50001", time.Second, "localhost:50000")
+
+	client := NewMessenger()
+	defer client.Leave()
+	client.Join("localhost:40000", time.Second, "localhost:50000")
+
+	c, s1, s2 := 0, 0, 0
+	server2.(*messenger).testReadMessage = func(conn net.Conn) {
+		c++
+		if c > 10 {
+			conn.Close()
+		}
+	}
+
+	for i := 0; i < 100; i++ {
+		reply, err := client.Request("job", []byte("Hello"), time.Second)
+		rep := string(reply)
+		if err != nil {
+			t.Errorf("Request returned error: %s", err)
+			break
+		}
+		switch rep {
+		case "server:1 Hello":
+			s1++
+		case "server:2 Hello":
+			s2++
+		default:
+			t.Errorf("Expected: 'Hello'; received '%s'", string(reply))
+			break
+		}
+	}
+
+	log.Printf("counts: s1: %d, s2: %d", s1, s2)
+	if s1 != 90 || s2 != 10 {
+		t.Errorf("Wrong counts")
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	c, s1, s2 = 0, 0, 0
+
+	for i := 0; i < 100; i++ {
+		reply, err := client.Request("job", []byte("Hello"), time.Second)
+		rep := string(reply)
+		if err != nil {
+			t.Errorf("Request returned error: %s", err)
+			break
+		}
+		switch rep {
+		case "server:1 Hello":
+			s1++
+		case "server:2 Hello":
+			s2++
+		default:
+			t.Errorf("Expected: 'Hello'; received '%s'", string(reply))
+			break
+		}
+	}
+
+	log.Printf("counts: s1: %d, s2: %d", s1, s2)
+	if s1 != 90 || s2 != 10 {
 		t.Errorf("Wrong counts")
 	}
 }
