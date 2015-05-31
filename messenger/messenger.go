@@ -14,7 +14,7 @@ import (
 )
 
 var (
-	FailedToJoinError  = errors.New("jailed to join")
+	FailedToJoinError  = errors.New("failed to join")
 	TimeoutError       = errors.New("timed out")
 	NoSubscribersError = errors.New("no subscribers")
 	NilConnError       = errors.New("null connection")
@@ -33,8 +33,8 @@ type Messenger interface {
 
 	// No more then one subscription per topic.
 	// Second subscription panics.
-	Subscribe(topic string, handler Handler) error
-	Unsubscribe(topic string) error
+	Subscribe(topic string, handler Handler)
+	Unsubscribe(topic string)
 
 	SetLogger(logger Logger)
 }
@@ -51,7 +51,7 @@ const (
 	reply
 	joinInvite
 	joinAccept
-	leave
+	leaving
 	subscribe
 	unsubscribe
 )
@@ -82,7 +82,6 @@ type messenger struct {
 	subscriptions
 	servers
 	clients
-	dialingList     chan hostId
 	dialMutex       sync.Mutex
 	testReadMessage func(conn net.Conn)
 	closing         bool
@@ -94,7 +93,6 @@ func NewMessenger() Messenger {
 		subscriptions:   subscriptions{handlers: make(handlers)},
 		clients:         clients{hosts: make(map[hostId]*client)},
 		servers:         servers{hosts: make(map[hostId]*server)},
-		dialingList:     make(chan hostId),
 		testReadMessage: func(conn net.Conn) {},
 	}
 }
@@ -120,7 +118,18 @@ type server struct {
 	conn   net.Conn
 	topics map[topic]struct{}
 	pendingReplies
+	serverState
 }
+
+type serverState int
+
+const (
+	serverConnected serverState = iota
+	serverLeaving
+	serverLeft
+	serverDisconnected
+	serverDoesNotExist
+)
 
 type client struct {
 	sync.Mutex
@@ -171,18 +180,18 @@ func (msgr *messenger) getHandler(t topic) Handler {
 	return handler
 }
 
-func (msgr *messenger) Subscribe(_topic string, handler Handler) error {
+func (msgr *messenger) Subscribe(_topic string, handler Handler) {
 	msgr.subscriptions.Lock()
 	msgr.subscriptions.handlers[topic(_topic)] = handler
 	msgr.subscriptions.Unlock()
-	return msgr.broadcastSubscribtion(_topic, subscribe)
+	msgr.broadcastSubscribtion(subscribe, _topic)
 }
 
-func (msgr *messenger) Unsubscribe(_topic string) error {
+func (msgr *messenger) Unsubscribe(_topic string) {
 	msgr.subscriptions.Lock()
 	delete(msgr.subscriptions.handlers, topic(_topic))
 	msgr.subscriptions.Unlock()
-	return msgr.broadcastSubscribtion(_topic, unsubscribe)
+	msgr.broadcastSubscribtion(unsubscribe, _topic)
 }
 
 func (msgr *messenger) newClient(clientId hostId, conn net.Conn) {
@@ -224,11 +233,14 @@ func (msgr *messenger) getClientIds() []hostId {
 }
 
 func (msgr *messenger) newServer(serverId hostId, conn net.Conn, topics []topic) {
+	msgr.removeServer(serverId)
+
 	server := &server{
 		hostId:         serverId,
 		conn:           conn,
 		topics:         mapTopics(topics),
 		pendingReplies: make(pendingReplies),
+		serverState:    serverConnected,
 	}
 
 	msgr.servers.Lock()
@@ -239,36 +251,52 @@ func (msgr *messenger) newServer(serverId hostId, conn net.Conn, topics []topic)
 	go msgr.serverReadLoop(serverId)
 }
 
-func (msgr *messenger) isServerConnected(serverId hostId) bool {
+func (msgr *messenger) getServerState(serverId hostId) serverState {
 	msgr.servers.Mutex.Lock()
-	_, connected := msgr.servers.hosts[serverId]
+	defer msgr.servers.Unlock()
+
+	server := msgr.servers.hosts[serverId]
+	if server == nil {
+		return serverDoesNotExist
+	}
+	return server.serverState
+}
+
+func (msgr *messenger) setServerState(serverId hostId, state serverState) {
+	msgr.servers.Mutex.Lock()
+
+	server := msgr.servers.hosts[serverId]
+	if server != nil {
+		server.serverState = state
+	}
 
 	msgr.servers.Unlock()
-	return connected
 }
 
 func (msgr *messenger) getServerIds() []hostId {
 	msgr.servers.Mutex.Lock()
 	result := make([]hostId, 0, len(msgr.servers.hosts))
-	for id := range msgr.servers.hosts {
-		result = append(result, id)
+	for id, server := range msgr.servers.hosts {
+		if server.serverState == serverConnected {
+			result = append(result, id)
+		}
 	}
 	msgr.servers.Unlock()
 	return result
 }
 
 func (msgr *messenger) getServerIdsByTopic(_topic topic) (result []hostId) {
-	serverIds := msgr.getServerIds()
-	for _, serverId := range serverIds {
-		server := msgr.servers.hosts[serverId]
-		if server != nil {
+	msgr.servers.Mutex.Lock()
+	for id, server := range msgr.servers.hosts {
+		if server.serverState == serverConnected {
 			server.Lock()
 			if _, found := server.topics[_topic]; found {
-				result = append(result, serverId)
+				result = append(result, id)
 			}
 			server.Unlock()
 		}
 	}
+	msgr.servers.Unlock()
 	return result
 }
 
@@ -284,14 +312,23 @@ func (msgr *messenger) getServerConn(serverId hostId) (result net.Conn) {
 
 func (msgr *messenger) removeServer(serverId hostId) {
 	msgr.servers.Mutex.Lock()
+	defer msgr.servers.Unlock()
+
 	server := msgr.servers.hosts[serverId]
+	if server == nil {
+		return
+	}
 	delete(msgr.servers.hosts, serverId)
+	server.Lock()
 	if server != nil {
 		for _, replyChan := range server.pendingReplies {
 			replyChan <- &replyMessage{replyCode: disconnected}
 		}
 	}
-	msgr.servers.Unlock()
+	if server.conn != nil {
+		server.conn.Close()
+	}
+	server.Unlock()
 }
 
 func (msgr *messenger) addServerTopic(serverId hostId, _topic topic) {
@@ -400,60 +437,73 @@ func (msgr *messenger) Join(local string, remotes ...string) error {
 	return nil
 }
 
-func (msgr *messenger) scheduleRedial(_hostId hostId) {
+func (msgr *messenger) scheduleRedial(serverId hostId) {
 	time.AfterFunc(RedialInterval, func() {
-		msgr.dial(_hostId)
+		msgr.dial(serverId)
 	})
 }
 
-func (msgr *messenger) dial(_hostId hostId) error {
+func (msgr *messenger) dial(serverId hostId) error {
 	if msgr.closing {
 		return nil
 	}
 
-	msgr.Debugf("%s: dialing %s", msgr.hostId, _hostId)
+	msgr.Debugf("%s: dialing %s", msgr.hostId, serverId)
 
-	if msgr.hostId == _hostId {
-		msgr.Debugf("%s: dial: Won't dial self. Skipping.", msgr.hostId)
+	if msgr.hostId == serverId {
+		msgr.Debugf("%s: dial.10: Won't dial self. Skipping.", msgr.hostId)
 		return nil
 	}
 
 	msgr.dialMutex.Lock()
 	defer msgr.dialMutex.Unlock()
 
-	if msgr.isServerConnected(_hostId) {
-		msgr.Debugf("%s: dial: host %s is already connected. Skipping.", msgr.hostId, _hostId)
+	state := msgr.getServerState(serverId)
+	msgr.Debugf("%s: dial.20: server state = %s", msgr.hostId, state)
+
+	if state == serverLeaving {
+		msgr.Debugf("%s: dial.30: server %s is leaving.", msgr.hostId, serverId)
 		return nil
 	}
 
-	conn, err := net.Dial("tcp", string(_hostId))
+	if state == serverConnected {
+		msgr.Debugf("%s: dial.40: host %s is already connected.", msgr.hostId, serverId)
+		return nil
+	}
+
+	conn, err := net.Dial("tcp", string(serverId))
+	msgr.Debugf("%s: dial.50: err = %v", msgr.connId(conn), err)
 	if err != nil {
-		msgr.Errorf("%s: Failed to connect to '%s'. Will re-try.", msgr.hostId, _hostId)
-		msgr.scheduleRedial(_hostId)
+		msgr.Errorf("%s: Failed to connect to '%s'. Will re-try.", msgr.hostId, serverId)
+		msgr.scheduleRedial(serverId)
 		return err
 	}
 
 	err = msgr.writeJoinInvite(conn)
+	msgr.Debugf("%s: dial.60: wrote invite; err = %v", msgr.connId(conn), err)
 	if err != nil {
-		msgr.Errorf("%s: Failed to invite '%s'. Will re-try.", msgr.hostId, _hostId)
-		msgr.scheduleRedial(_hostId)
+		msgr.Errorf("%s: Failed to invite '%s'. Will re-try.", msgr.hostId, serverId)
+		msgr.scheduleRedial(serverId)
 		return err
 	}
 
 	reply, err := msgr.readJoinAccept(conn)
+	msgr.Debugf("%s: dial.60: read accept; err = %v", msgr.connId(conn), err)
 	if err != nil {
 		msgr.Errorf("Failed to read join accept from '%s'. Will re-try.", conn)
-		msgr.scheduleRedial(_hostId)
+		msgr.scheduleRedial(serverId)
 		return err
 	}
 
-	msgr.newServer(_hostId, conn, reply.Topics)
+	msgr.Debugf("%s: dial.70: create new server", msgr.connId(conn))
+	msgr.newServer(serverId, conn, reply.Topics)
 
+	msgr.Debugf("%s: dial.80: dialing = %v", msgr.connId(conn), reply.Peers)
 	for _, hostId := range reply.Peers {
 		go msgr.dial(hostId)
 	}
 
-	// msgr.Infof("%s: Joined by %s; clients = %s; servers = %s", msgr.hostId, _hostId, msgr.getClientIds(), msgr.getServerIds())
+	// msgr.Infof("%s: Joined by %s; clients = %s; servers = %s", msgr.hostId, serverId, msgr.getClientIds(), msgr.getServerIds())
 
 	return nil
 }
@@ -469,24 +519,24 @@ func (msgr *messenger) acceptConnections() {
 			continue
 		}
 
-		_hostId, err := msgr.readJoinInvite(conn)
+		clientId, err := msgr.readJoinInvite(conn)
 		if err != nil {
-			msgr.Errorf("Failed to read join invite to '%s'. Will re-try.", _hostId)
-			msgr.scheduleRedial(_hostId)
+			msgr.Errorf("Failed to read join invite to '%s'. Will re-try.", clientId)
+			msgr.scheduleRedial(clientId)
 			return
 		}
 
 		err = msgr.writeJoinAccept(conn)
 		if err != nil {
-			msgr.Errorf("Failed to write join accept to '%s'. Will re-try.", _hostId)
-			msgr.scheduleRedial(_hostId)
+			msgr.Errorf("Failed to write join accept to '%s'. Will re-try.", clientId)
+			msgr.scheduleRedial(clientId)
 			return
 		}
 
-		msgr.newClient(_hostId, conn)
-		go msgr.dial(_hostId)
+		msgr.newClient(clientId, conn)
+		go msgr.dial(clientId)
 
-		msgr.Infof("%s: Joined by %s", msgr.hostId, _hostId)
+		msgr.Infof("%s: %s has joined.", msgr.hostId, clientId)
 	}
 }
 
@@ -561,10 +611,9 @@ func (msgr *messenger) clientReadLoop(clientId hostId) {
 		msg, err := readMessage(conn)
 		if err != nil {
 			msgr.removeClient(clientId)
-			msgr.removeServer(clientId)
 			msgr.Debugf("%s: clientReadLoop removed clientId = %s", msgr.connId(conn), clientId)
 			if err.Error() == "EOF" {
-				msgr.Infof("%s: Client %s disconnected.", msgr.hostId, clientId)
+				msgr.Debugf("%s: Client %s disconnected.", msgr.hostId, clientId)
 			} else {
 				msgr.Errorf("%s: Failed to read from client. Disconnecting.", msgr.hostId)
 			}
@@ -585,17 +634,14 @@ func (msgr *messenger) clientReadLoop(clientId hostId) {
 }
 
 func (msgr *messenger) serverReadLoop(serverId hostId) {
-	msgr.Debugf("%s: serverReadLoop.1 serverId = %s", msgr.hostId, serverId)
 	var conn net.Conn = msgr.getServerConn(serverId)
-	msgr.Debugf("%s: serverReadLoop.2 serverId = %s", msgr.connId(conn), serverId)
 	for {
 		msgr.testReadMessage(conn)
 		msg, err := readMessage(conn)
+		msgr.Debugf("%s: serverReadLoop received message = %+v; err = %+v", msgr.connId(conn), msg, err)
 		if err != nil {
-			msgr.removeServer(serverId)
-			msgr.Debugf("%s: serverReadLoop.3 removed serverId = %s", msgr.connId(conn), serverId)
 			if err.Error() == "EOF" {
-				msgr.Infof("%s: Server %s disconnected.", msgr.hostId, serverId)
+				msgr.Infof("%s: %s has left.", msgr.hostId, serverId)
 			} else {
 				msgr.Errorf("%s: Failed to read from server (%v). Disconnecting.", msgr.connId(conn), err)
 			}
@@ -604,7 +650,14 @@ func (msgr *messenger) serverReadLoop(serverId hostId) {
 				conn.Close()
 			}
 
-			go msgr.dial(serverId)
+			state := msgr.getServerState(serverId)
+			if state == serverLeaving {
+				msgr.removeServer(serverId)
+			} else {
+				msgr.setServerState(serverId, serverDisconnected)
+				go msgr.dial(serverId)
+			}
+
 			return
 		}
 
@@ -613,6 +666,8 @@ func (msgr *messenger) serverReadLoop(serverId hostId) {
 			go msgr.handleReply(serverId, msg)
 		case subscribe, unsubscribe:
 			go msgr.handleSubscription(serverId, msg)
+		case leaving:
+			go msgr.handleLeaving(serverId)
 		default:
 			panic(fmt.Errorf("Read unknown client message type %s", msg.MessageType))
 		}
@@ -641,6 +696,12 @@ func (msgr *messenger) handleRequest(clientId hostId, msg *message) {
 		return
 	}
 	msgr.writeMessage(conn, reply)
+}
+
+func (msgr *messenger) handleLeaving(serverId hostId) {
+	msgr.Debugf("%s: handleRequest: received leaving message")
+	msgr.setServerState(serverId, serverLeaving)
+	// TODO: Graceful shutdown
 }
 
 func (msgr *messenger) handleReply(serverId hostId, msg *message) {
@@ -674,17 +735,18 @@ func (msgr *messenger) Leave() {
 	if msgr.Listener != nil {
 		msgr.Listener.Close()
 	}
+	msgr.clientBroadcast(leaving, nil)
 	// TODO: Graceful shutdown
 }
 
-func (msgr *messenger) broadcastSubscribtion(topic string, msgType messageType) error {
+func (msgr *messenger) broadcastSubscribtion(msgType messageType, topic string) {
 	if msgr.Listener == nil {
-		return nil
+		return
 	}
 	buf := &bytes.Buffer{}
 	encode(topic, buf)
 
-	return msgr.broadcast("", buf.Bytes(), msgType, msgr.getClientIds())
+	msgr.clientBroadcast(msgType, buf.Bytes())
 }
 
 func (msgr *messenger) Publish(_topic string, body []byte) error {
@@ -702,7 +764,7 @@ func (msgr *messenger) Publish(_topic string, body []byte) error {
 		}
 		conn := msgr.getServerConn(to)
 		if conn == nil {
-			msgr.removeServer(to)
+			msgr.setServerState(to, serverDisconnected)
 			continue
 		}
 
@@ -714,25 +776,22 @@ func (msgr *messenger) Publish(_topic string, body []byte) error {
 }
 
 func (msgr *messenger) Broadcast(_topic string, body []byte) error {
-	return msgr.broadcast(_topic, body, publish, msgr.getServerIdsByTopic(topic(_topic)))
-}
-
-func (msgr *messenger) broadcast(_topic string, body []byte, msgType messageType, clientIds []hostId) error {
+	serverIds := msgr.getServerIdsByTopic(topic(_topic))
 	msg := &message{
 		MessageId:   newId(),
-		MessageType: msgType,
+		MessageType: publish,
 		Topic:       topic(_topic),
 		Body:        body,
 	}
 
-	if len(clientIds) == 0 {
+	if len(serverIds) == 0 {
 		return NoSubscribersError
 	}
 	var wg = sync.WaitGroup{}
-	wg.Add(len(clientIds))
-	for _, to := range clientIds {
+	wg.Add(len(serverIds))
+	for _, to := range serverIds {
 		clientId := to
-		conn := msgr.getClientConn(clientId)
+		conn := msgr.getServerConn(clientId)
 		go func() {
 			if conn != nil {
 				msgr.writeMessage(conn, msg)
@@ -742,6 +801,36 @@ func (msgr *messenger) broadcast(_topic string, body []byte, msgType messageType
 	}
 	wg.Wait()
 	return nil
+}
+
+func (msgr *messenger) clientBroadcast(msgType messageType, body []byte) {
+	clientIds := msgr.getClientIds()
+	msgr.Debugf("%s: clientBroadcast.10: Broadcasting message %s to clients: %s", msgr.hostId, msgType, clientIds)
+	msg := &message{
+		MessageId:   newId(),
+		MessageType: msgType,
+		Topic:       "",
+		Body:        body,
+	}
+
+	if len(clientIds) == 0 {
+		return
+	}
+	var wg = sync.WaitGroup{}
+	wg.Add(len(clientIds))
+	for _, to := range clientIds {
+		clientId := to
+		conn := msgr.getClientConn(clientId)
+		go func() {
+			if conn != nil {
+				msgr.Debugf("%s: clientBroadcast.20: writing message", msgr.connId(conn))
+				msgr.writeMessage(conn, msg)
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+	return
 }
 
 func (msgr *messenger) Request(_topic string, body []byte, timeout time.Duration) ([]byte, error) {
@@ -761,7 +850,7 @@ func (msgr *messenger) Request(_topic string, body []byte, timeout time.Duration
 		}
 		conn := msgr.getServerConn(serverId)
 		if conn == nil {
-			msgr.removeServer(serverId)
+			msgr.setServerState(serverId, serverDisconnected)
 			continue
 		}
 
@@ -902,8 +991,8 @@ func (mType messageType) String() string {
 		return "joinInvite"
 	case joinAccept:
 		return "joinAccept"
-	case leave:
-		return "leave"
+	case leaving:
+		return "leaving"
 	case subscribe:
 		return "subscribe"
 	case unsubscribe:

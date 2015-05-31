@@ -105,6 +105,7 @@ func run() {
 		time.Sleep(20 * time.Microsecond)
 	}
 	wg.Wait()
+	msgr.Leave()
 }
 
 func handler(topic string, body []byte) []byte {

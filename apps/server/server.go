@@ -2,11 +2,17 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"github.com/andrew-suprun/envoy/messenger"
 	"log"
+	"math/rand"
+	"os"
+	"os/signal"
 	"runtime"
 	"strings"
 	"sync/atomic"
+	"syscall"
+	"time"
 )
 
 var localAddrFlag = flag.String("local", "", "Local address to bind to.")
@@ -21,10 +27,7 @@ func main() {
 	log.SetFlags(log.Lmicroseconds)
 	flag.Parse()
 	msgr := messenger.NewMessenger()
-	err := msgr.Subscribe("job", handler)
-	if err != nil {
-		panic(err)
-	}
+	msgr.Subscribe("job", handler)
 
 	remotes := []string{}
 	if *remoteAddrFlag != "" {
@@ -35,10 +38,22 @@ func main() {
 		workers <- struct{}{}
 	}
 
-	err = msgr.Join(*localAddrFlag, remotes...)
+	err := msgr.Join(*localAddrFlag, remotes...)
 	if err != nil {
 		log.Printf("Error: %v", err)
 	}
+
+	sigs := make(chan os.Signal)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		for {
+			<-sigs
+			fmt.Println("\nLeaving...")
+			msgr.Leave()
+			fmt.Println("Buy.")
+			os.Exit(0)
+		}
+	}()
 
 	select {}
 }
