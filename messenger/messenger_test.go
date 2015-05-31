@@ -15,11 +15,11 @@ func TestSimpleOneOnOne(t *testing.T) {
 	server := NewMessenger()
 	defer server.Leave()
 	server.Subscribe("job", echo)
-	server.Join("localhost:50000", time.Second)
+	server.Join("localhost:50000", "localhost:20000")
 
 	client := NewMessenger()
 	defer client.Leave()
-	client.Join("localhost:40000", time.Second, "localhost:50000")
+	client.Join("localhost:40000", "localhost:50000")
 
 	for i := 0; i < 20; i++ {
 		reply, err := client.Request("job", []byte("Hello"), time.Second)
@@ -38,20 +38,20 @@ func TestTwoOnTwo(t *testing.T) {
 	server1 := NewMessenger()
 	defer server1.Leave()
 	server1.Subscribe("job", echo1)
-	server1.Join("localhost:50000", time.Second)
+	server1.Join("localhost:50000")
 
 	server2 := NewMessenger()
 	defer server2.Leave()
 	server2.Subscribe("job", echo2)
-	server2.Join("localhost:50001", time.Second, "localhost:50000")
+	server2.Join("localhost:50001", "localhost:50000")
 
 	client1 := NewMessenger()
 	defer client1.Leave()
-	client1.Join("localhost:40000", time.Second, "localhost:50000")
+	client1.Join("localhost:40000", "localhost:50000")
 
 	client2 := NewMessenger()
 	defer client2.Leave()
-	client2.Join("localhost:40001", time.Second, "localhost:50000")
+	client2.Join("localhost:40001", "localhost:50000")
 
 	c := 0
 	server2.(*messenger).testReadMessage = func(conn net.Conn) {
@@ -119,18 +119,18 @@ func XXX_TestReconnect(t *testing.T) {
 	server1 := NewMessenger()
 	defer server1.Leave()
 	server1.Subscribe("job", echo1)
-	server1.Join("localhost:50000", time.Second)
+	server1.Join("localhost:50000")
 	log.Println(">>> server 1 is up.")
 
 	server2 := NewMessenger()
 	defer server2.Leave()
 	server2.Subscribe("job", echo2)
-	server2.Join("localhost:50001", time.Second, "localhost:50000")
+	server2.Join("localhost:50001", "localhost:50000")
 	log.Println(">>> server 2 is up.")
 
 	client := NewMessenger()
 	defer client.Leave()
-	client.Join("localhost:40000", time.Second, "localhost:50000")
+	client.Join("localhost:40000", "localhost:50000")
 	log.Println(">>> client is up.")
 
 	c, s1, s2 := 0, 0, 0

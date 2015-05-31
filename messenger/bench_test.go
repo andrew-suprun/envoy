@@ -23,13 +23,13 @@ func Benchmark1(b *testing.B) {
 	if err != nil {
 		b.Fatalf("Failed to start server: %v", err)
 	}
-	server.Join("localhost:55555", time.Second)
+	server.Join("localhost:55555")
 	defer server.Leave()
 
 	client := NewMessenger()
-	n := client.Join("localhost:44444", time.Second, "localhost:55555")
-	if n == 0 {
-		b.Fatalf("Server failed to join: %s", err)
+	err = client.Join("localhost:44444", "localhost:55555")
+	if err != nil {
+		b.Fatalf("Server failed to join: %v", err)
 	}
 	defer client.Leave()
 

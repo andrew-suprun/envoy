@@ -7,28 +7,30 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-const threads = 10000
-const msgSize = 50 * 1024
-const duration = 20 * time.Second
+const threads = 2000
+const msgSize = 1 * 1024
+const duration = 60 * time.Second
 
-var localAddrFlag = flag.String("local", "localhost:44444", "Local address.")
-var remoteAddrFlag = flag.String("remotes", "localhost:55555", "Comma separated remote addresses.")
+var localAddrFlag = flag.String("local", "", "Local address.")
+var remoteAddrFlag = flag.String("remotes", "", "Comma separated remote addresses.")
 
 var maxDuration time.Duration
 var totalDurations time.Duration
 var maxDurationMutex sync.Mutex
 
 var (
-	okCount  int64
-	errCount int64
-	done     bool
-	wg       sync.WaitGroup
+	timestamp time.Time
+	okCount   int64
+	errCount  int64
+	done      bool
+	wg        sync.WaitGroup
 )
 
 func main() {
@@ -59,7 +61,7 @@ func run() {
 	remotes := strings.Split(*remoteAddrFlag, ",")
 	msgr.Subscribe("client1", handler)
 	if len(remotes) > 0 {
-		err := msgr.Join(*localAddrFlag, time.Second, remotes...)
+		err := msgr.Join(*localAddrFlag, remotes...)
 		if err != nil {
 			fmt.Printf("Failed to join. Exiting\n")
 			os.Exit(1)
@@ -68,14 +70,15 @@ func run() {
 
 	buf := make([]byte, msgSize)
 	wg.Add(threads)
+	timestamp = time.Now()
 	for i := 1; i <= threads; i++ {
 		thread := i
 		go func(thread int) {
 			for job := 1; !done; job++ {
 				start := time.Now()
 
-				err := msgr.Publish("job", buf)
-				// _, err := msgr.Request("job", buf, 30*time.Second)
+				// err := msgr.Publish("job", buf)
+				_, err := msgr.Request("job", buf, 30*time.Second)
 
 				duration := time.Now().Sub(start)
 				maxDurationMutex.Lock()
@@ -83,12 +86,18 @@ func run() {
 				if maxDuration < duration {
 					maxDuration = duration
 				}
-				maxDurationMutex.Unlock()
 				if err == nil {
-					atomic.AddInt64(&okCount, 1)
+					c := atomic.AddInt64(&okCount, 1)
+					if c%2000 == 0 {
+						ts := time.Now()
+						log.Println(c, ts.Sub(timestamp))
+						timestamp = ts
+					}
 				} else {
 					atomic.AddInt64(&errCount, 1)
 				}
+				maxDurationMutex.Unlock()
+
 				logError(err)
 			}
 			wg.Done()
@@ -104,6 +113,6 @@ func handler(topic string, body []byte) []byte {
 
 func logError(err error) {
 	if err != nil {
-		log.Printf("### Error[%T]: %v", err, err)
+		log.Printf("### Error[%T]: %v: Stack:\n%s", err, err, string(debug.Stack()))
 	}
 }

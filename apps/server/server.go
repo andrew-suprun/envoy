@@ -7,11 +7,14 @@ import (
 	"runtime"
 	"strings"
 	"sync/atomic"
-	"time"
 )
 
-var localAddrFlag = flag.String("local", "localhost:55555", "Local address to bind to.")
-var remoteAddrFlag = flag.String("remotes", "localhost:44444", "Comma separated remote addresses.")
+var localAddrFlag = flag.String("local", "", "Local address to bind to.")
+var remoteAddrFlag = flag.String("remotes", "", "Comma separated remote addresses.")
+
+const threads = 200
+
+var workers = make(chan struct{}, threads)
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
@@ -28,7 +31,11 @@ func main() {
 		remotes = strings.Split(*remoteAddrFlag, ",")
 	}
 
-	err = msgr.Join(*localAddrFlag, time.Second, remotes...)
+	for i := 0; i < threads; i++ {
+		workers <- struct{}{}
+	}
+
+	err = msgr.Join(*localAddrFlag, remotes...)
 	if err != nil {
 		log.Printf("Error: %v", err)
 	}
@@ -39,12 +46,13 @@ func main() {
 var count int64
 
 func handler(topic string, body []byte) []byte {
+	<-workers
 	c := atomic.AddInt64(&count, 1)
-	// result := append([]byte(fmt.Sprintf("[%d]: ", c)), body...)
 	if c%1000 == 0 {
 		log.Println(c)
 	}
-	// time.Sleep(time.Duration(rand.Intn(3000)+2000) * time.Millisecond)
+	time.Sleep(time.Duration(rand.Intn(100)+100) * time.Millisecond)
+	workers <- struct{}{}
 	return body
 }
 

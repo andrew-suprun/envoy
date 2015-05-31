@@ -14,15 +14,16 @@ import (
 )
 
 var (
+	FailedToJoinError  = errors.New("jailed to join")
 	TimeoutError       = errors.New("timed out")
 	NoSubscribersError = errors.New("no subscribers")
 	NilConnError       = errors.New("null connection")
 )
 
-var ReconnectInterval = 10 * time.Second
+var RedialInterval = 10 * time.Second
 
 type Messenger interface {
-	Join(local string, timeout time.Duration, remotes ...string) int
+	Join(local string, remotes ...string) error
 	Leave()
 
 	Request(topic string, body []byte, timeout time.Duration) ([]byte, error)
@@ -48,7 +49,8 @@ const (
 	publish messageType = iota
 	request
 	reply
-	join
+	joinInvite
+	joinAccept
 	leave
 	subscribe
 	unsubscribe
@@ -80,11 +82,21 @@ type messenger struct {
 	subscriptions
 	servers
 	clients
-	pendingDial
-	cond            *sync.Cond
-	ticker          *time.Ticker
+	dialingList     chan hostId
+	dialMutex       sync.Mutex
 	testReadMessage func(conn net.Conn)
 	closing         bool
+}
+
+func NewMessenger() Messenger {
+	return &messenger{
+		Logger:          defaultLogger,
+		subscriptions:   subscriptions{handlers: make(handlers)},
+		clients:         clients{hosts: make(map[hostId]*client)},
+		servers:         servers{hosts: make(map[hostId]*server)},
+		dialingList:     make(chan hostId),
+		testReadMessage: func(conn net.Conn) {},
+	}
 }
 
 type subscriptions struct {
@@ -116,11 +128,6 @@ type client struct {
 	conn net.Conn
 }
 
-type pendingDial struct {
-	sync.Mutex
-	ids map[hostId]struct{}
-}
-
 type message struct {
 	MessageId   messageId   `codec:"id"`
 	MessageType messageType `codec:"mt"`
@@ -133,8 +140,11 @@ type replyMessage struct {
 	replyCode
 }
 
-type joinMessageBody struct {
-	HostId hostId   `codec:"id,omitempty"`
+// type joinInviteBody struct {
+// 	HostId hostId `codec:"id,omitempty"`
+// }
+
+type joinAcceptBody struct {
 	Topics []topic  `codec:"t,omitempty"`
 	Peers  []hostId `codec:"p,omitempty"`
 }
@@ -142,19 +152,6 @@ type joinMessageBody struct {
 type subscribeMessageBody struct {
 	HostId hostId `codec:"id,omitempty"`
 	Topic  topic  `codec:"t,omitempty"`
-}
-
-func NewMessenger() Messenger {
-	return &messenger{
-		Logger:          defaultLogger,
-		subscriptions:   subscriptions{handlers: make(handlers)},
-		clients:         clients{hosts: make(map[hostId]*client)},
-		servers:         servers{hosts: make(map[hostId]*server)},
-		cond:            sync.NewCond(&sync.Mutex{}),
-		ticker:          time.NewTicker(ReconnectInterval),
-		pendingDial:     pendingDial{ids: make(map[hostId]struct{})},
-		testReadMessage: func(conn net.Conn) {},
-	}
 }
 
 func (msgr *messenger) getTopics() []topic {
@@ -226,10 +223,11 @@ func (msgr *messenger) getClientIds() []hostId {
 	return result
 }
 
-func (msgr *messenger) newServer(serverId hostId, conn net.Conn) {
+func (msgr *messenger) newServer(serverId hostId, conn net.Conn, topics []topic) {
 	server := &server{
 		hostId:         serverId,
 		conn:           conn,
+		topics:         mapTopics(topics),
 		pendingReplies: make(pendingReplies),
 	}
 
@@ -239,20 +237,6 @@ func (msgr *messenger) newServer(serverId hostId, conn net.Conn) {
 	msgr.Debugf("%s: newServer: %s", msgr.connId(conn), server)
 
 	go msgr.serverReadLoop(serverId)
-}
-
-func (msgr *messenger) setServerTopics(serverId hostId, topics []topic) {
-	msgr.servers.Lock()
-	server := msgr.servers.hosts[serverId]
-	msgr.servers.Unlock()
-
-	if server == nil {
-		return
-	}
-
-	server.Lock()
-	server.topics = mapTopics(topics)
-	server.Unlock()
 }
 
 func (msgr *messenger) isServerConnected(serverId hostId) bool {
@@ -334,31 +318,6 @@ func (msgr *messenger) removeServerTopic(serverId hostId, _topic topic) {
 	server.Unlock()
 }
 
-func (msgr *messenger) addPendingDial(serverId hostId) {
-	msgr.pendingDial.Lock()
-	msgr.pendingDial.ids[serverId] = struct{}{}
-	msgr.pendingDial.Unlock()
-	msgr.cond.L.Lock()
-	msgr.cond.Signal()
-	msgr.cond.L.Unlock()
-}
-
-func (msgr *messenger) removePendingDial(serverId hostId) {
-	msgr.pendingDial.Lock()
-	delete(msgr.pendingDial.ids, serverId)
-	msgr.pendingDial.Unlock()
-}
-
-func (msgr *messenger) getPendingDials() []hostId {
-	msgr.pendingDial.Lock()
-	ids := make([]hostId, 0, len(msgr.pendingDial.ids))
-	for id := range msgr.pendingDial.ids {
-		ids = append(ids, id)
-	}
-	msgr.pendingDial.Unlock()
-	return ids
-}
-
 func (msgr *messenger) setReplyChan(serverId hostId, msgId messageId) chan *replyMessage {
 	msgr.servers.Lock()
 	server := msgr.servers.hosts[serverId]
@@ -398,120 +357,136 @@ func (msgr *messenger) removeReplyChan(serverId hostId, msgId messageId) {
 	server.Unlock()
 }
 
-func (msgr *messenger) Join(local string, timeout time.Duration, remotes ...string) int {
+func (msgr *messenger) Join(local string, remotes ...string) error {
 	msgr.Debugf("Join: local = %s; remotes = %s", local, remotes)
-	for _, remote := range remotes {
-		pendingHost, err := net.ResolveTCPAddr("tcp", remote)
-		if err != nil {
-			msgr.Errorf("%s: Cannot resolve address %s. Ignoring.", remote)
-		}
-		msgr.addPendingDial(hostId(pendingHost.String()))
-	}
 
-	var err error
+	addr, err := resolveAddr(local)
+	if err != nil {
+		return err
+	}
+	local = string(addr)
+
 	msgr.Listener, err = net.Listen("tcp", local)
 	if err != nil {
 		msgr.Errorf("Failed to listen on %s", local)
-		return 0
+		return err
 	}
 	msgr.hostId = hostId(msgr.Listener.Addr().String())
 	msgr.Infof("Listening on: %s", msgr.hostId)
 
 	go msgr.acceptConnections()
 
-	msgr.Debugf("%s: Join: pendingDial = %v", msgr.hostId, msgr.getPendingDials())
-
-	dialChan := make(chan int)
-	go msgr.dialConnections(dialChan)
-	go msgr.tickTock()
-	return <-dialChan
-}
-
-func (msgr *messenger) tickTock() {
-	for {
-		<-msgr.ticker.C
-		msgr.cond.L.Lock()
-		msgr.cond.Signal()
-		msgr.cond.L.Unlock()
+	joined := len(remotes) == 0
+	for _, remote := range remotes {
+		pendingHost, err := resolveAddr(remote)
+		if err != nil {
+			msgr.Errorf("%s: Cannot resolve address %s. Ignoring.", remote)
+		}
+		err = msgr.dial(hostId(pendingHost))
+		joined = joined || err == nil
 	}
 
+	if !joined {
+		return FailedToJoinError
+	}
+
+	for {
+		if len(msgr.getClientIds()) == len(msgr.getServerIds()) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	return nil
 }
 
-func (msgr *messenger) dialConnections(dialChan chan int) {
-	msgr.Debugf("%s: dialConnections: entered", msgr.hostId)
-	connections := 0
-	sentConnected := false
+func (msgr *messenger) scheduleRedial(_hostId hostId) {
+	time.AfterFunc(RedialInterval, func() {
+		msgr.dial(_hostId)
+	})
+}
+
+func (msgr *messenger) dial(_hostId hostId) error {
+	if msgr.closing {
+		return nil
+	}
+
+	msgr.Debugf("%s: dialing %s", msgr.hostId, _hostId)
+
+	if msgr.hostId == _hostId {
+		msgr.Debugf("%s: dial: Won't dial self. Skipping.", msgr.hostId)
+		return nil
+	}
+
+	msgr.dialMutex.Lock()
+	defer msgr.dialMutex.Unlock()
+
+	if msgr.isServerConnected(_hostId) {
+		msgr.Debugf("%s: dial: host %s is already connected. Skipping.", msgr.hostId, _hostId)
+		return nil
+	}
+
+	conn, err := net.Dial("tcp", string(_hostId))
+	if err != nil {
+		msgr.Errorf("%s: Failed to connect to '%s'. Will re-try.", msgr.hostId, _hostId)
+		msgr.scheduleRedial(_hostId)
+		return err
+	}
+
+	err = msgr.writeJoinInvite(conn)
+	if err != nil {
+		msgr.Errorf("%s: Failed to invite '%s'. Will re-try.", msgr.hostId, _hostId)
+		msgr.scheduleRedial(_hostId)
+		return err
+	}
+
+	reply, err := msgr.readJoinAccept(conn)
+	if err != nil {
+		msgr.Errorf("Failed to read join accept from '%s'. Will re-try.", conn)
+		msgr.scheduleRedial(_hostId)
+		return err
+	}
+
+	msgr.newServer(_hostId, conn, reply.Topics)
+
+	for _, hostId := range reply.Peers {
+		go msgr.dial(hostId)
+	}
+
+	// msgr.Infof("%s: Joined by %s; clients = %s; servers = %s", msgr.hostId, _hostId, msgr.getClientIds(), msgr.getServerIds())
+
+	return nil
+}
+
+func (msgr *messenger) acceptConnections() {
 	for !msgr.closing {
-		pending := msgr.getPendingDials()
-		msgr.Debugf("%s: dialConnections: pending = %+v", msgr.hostId, pending)
-
-		if !sentConnected {
-			clients := msgr.getClientIds()
-			msgr.Debugf("%s: dialConnections: clients = %+v", msgr.hostId, clients)
-			servers := msgr.getServerIds()
-			msgr.Debugf("%s: dialConnections: servers = %+v", msgr.hostId, servers)
-			pendingClients := map[hostId]struct{}{}
-			for _, hostId := range servers {
-				pendingClients[hostId] = struct{}{}
-			}
-			for _, hostId := range pending {
-				pendingClients[hostId] = struct{}{}
-			}
-			for _, hostId := range clients {
-				delete(pendingClients, hostId)
-			}
-			if len(pendingClients) == 0 {
-				sentConnected = true
-				dialChan <- connections
-				msgr.Debugf("%s: dialConnections. sent %d to dialChan", msgr.hostId, connections)
-			}
-		}
-
-		if len(pending) == 0 {
-			msgr.Debugf("%s: dialConnections. Going to sleep...", msgr.hostId)
-			msgr.cond.L.Lock()
-			msgr.cond.Wait()
-			msgr.cond.L.Unlock()
-			msgr.Debugf("%s: dialConnections. Woke up.", msgr.hostId)
-		}
-
-		// msgr.Debugf("%s:    dialConnections: pending %s", msgr.hostId, pending)
-		for _, _hostId := range pending {
+		conn, err := msgr.Listener.Accept()
+		if err != nil {
 			if msgr.closing {
-				break
+				return
 			}
-			if msgr.hostId == _hostId {
-				continue
-			}
-
-			msgr.Debugf("%s:    dialConnections: connecting to host %s", msgr.hostId, _hostId)
-
-			if msgr.isServerConnected(_hostId) {
-				msgr.Debugf("%s:    dialConnections: host %s is connected. Skipping.", msgr.hostId, _hostId)
-				msgr.removePendingDial(_hostId)
-				continue
-			}
-
-			conn, err := net.Dial("tcp", string(_hostId))
-			if err != nil {
-				msgr.Errorf("Failed to connect to '%s'. Will re-try.", _hostId)
-				continue
-			}
-
-			err = msgr.writeJoinMessage(conn)
-			if err != nil {
-				if msgr.closing {
-					return
-				}
-				msgr.Errorf("Failed to write join message to '%s'. Will re-try.", _hostId)
-				continue
-			}
-
-			msgr.newServer(_hostId, conn)
-			msgr.removePendingDial(_hostId)
-
-			connections++
+			msgr.Errorf("%s: Failed to accept connection: %s", msgr.connId(conn), err)
+			continue
 		}
+
+		_hostId, err := msgr.readJoinInvite(conn)
+		if err != nil {
+			msgr.Errorf("Failed to read join invite to '%s'. Will re-try.", _hostId)
+			msgr.scheduleRedial(_hostId)
+			return
+		}
+
+		err = msgr.writeJoinAccept(conn)
+		if err != nil {
+			msgr.Errorf("Failed to write join accept to '%s'. Will re-try.", _hostId)
+			msgr.scheduleRedial(_hostId)
+			return
+		}
+
+		msgr.newClient(_hostId, conn)
+		go msgr.dial(_hostId)
+
+		msgr.Infof("%s: Joined by %s", msgr.hostId, _hostId)
 	}
 }
 
@@ -531,63 +506,47 @@ func mapTopics(topicSlice []topic) map[topic]struct{} {
 	return result
 }
 
-func (msgr *messenger) acceptConnections() {
-	for !msgr.closing {
-		conn, err := msgr.Listener.Accept()
-		if err != nil {
-			if msgr.closing {
-				return
-			}
-			msgr.Errorf("%s: Failed to accept connection: %s", msgr.connId(conn), err)
-			continue
-		}
-
-		msgr.Debugf("%s: acceptConnections.10: Accepted connection", msgr.connId(conn))
-		reply, err := msgr.readJoinMessage(conn)
-		msgr.Debugf("%s: acceptConnections.20: Read reply %+v", msgr.connId(conn), reply)
-		if err != nil {
-			if msgr.closing {
-				return
-			}
-			msgr.Errorf("Failed to read join message from '%s'. Will re-try.", conn)
-			continue
-		}
-
-		msgr.Debugf("%s: acceptConnections.30: Adding to connect list %+v", msgr.connId(conn), reply.HostId)
-		msgr.Debugf("%s: acceptConnections.40: Adding to connect list %+v", msgr.connId(conn), reply.Peers)
-
-		msgr.addPendingDial(reply.HostId)
-		for _, hostId := range reply.Peers {
-			msgr.addPendingDial(hostId)
-		}
-
-		msgr.Debugf("%s: acceptConnections.90: Set topics for server %s %+v", msgr.connId(conn), reply.HostId, reply.Topics)
-		msgr.setServerTopics(reply.HostId, reply.Topics)
-		msgr.newClient(reply.HostId, conn)
-		msgr.Infof("%s: Joined by %s", msgr.hostId, reply.HostId)
-	}
+func (msgr *messenger) writeJoinInvite(conn net.Conn) error {
+	buf := &bytes.Buffer{}
+	msgr.Debugf("%s: writeJoinInvite", msgr.connId(conn))
+	encode(msgr.hostId, buf)
+	return msgr.writeMessage(conn, &message{MessageId: newId(), MessageType: joinInvite, Body: buf.Bytes()})
 }
 
-func (msgr *messenger) writeJoinMessage(conn net.Conn) error {
+func (msgr *messenger) writeJoinAccept(conn net.Conn) error {
 	var topics []topic = msgr.getTopics()
 	var servers []hostId = msgr.getServerIds()
 
 	buf := &bytes.Buffer{}
-	msg := joinMessageBody{HostId: msgr.hostId, Topics: topics, Peers: servers}
-	codec.NewEncoder(buf, &ch).MustEncode(msg)
-	return msgr.writeMessage(conn, &message{MessageId: newId(), MessageType: join, Body: buf.Bytes()})
+	msg := joinAcceptBody{Topics: topics, Peers: servers}
+	msgr.Debugf("%s: joinAcceptBody: msg = %+v", msgr.connId(conn), msg)
+	encode(msg, buf)
+	return msgr.writeMessage(conn, &message{MessageId: newId(), MessageType: joinAccept, Body: buf.Bytes()})
 }
 
-func (msgr *messenger) readJoinMessage(conn net.Conn) (*joinMessageBody, error) {
-	joinReplyMsg, err := readMessage(conn)
+func (msgr *messenger) readJoinInvite(conn net.Conn) (hostId, error) {
+	joinMsg, err := readMessage(conn)
+	if err != nil {
+		return "", err
+	}
+
+	buf := bytes.NewBuffer(joinMsg.Body)
+	var reply hostId
+	decode(buf, &reply)
+	msgr.Debugf("%s: readJoinInvite: reply = %s", msgr.connId(conn), reply)
+	return reply, nil
+}
+
+func (msgr *messenger) readJoinAccept(conn net.Conn) (*joinAcceptBody, error) {
+	joinMsg, err := readMessage(conn)
 	if err != nil {
 		return nil, err
 	}
 
-	buf := bytes.NewBuffer(joinReplyMsg.Body)
-	reply := &joinMessageBody{}
+	buf := bytes.NewBuffer(joinMsg.Body)
+	reply := &joinAcceptBody{}
 	decode(buf, reply)
-	msgr.Debugf("%s: readJoinMessage: reply = %+v", msgr.connId(conn), *reply)
+	msgr.Debugf("%s: readJoinAccept: reply = %+v", msgr.connId(conn), *reply)
 	return reply, nil
 }
 
@@ -605,12 +564,14 @@ func (msgr *messenger) clientReadLoop(clientId hostId) {
 			msgr.removeServer(clientId)
 			msgr.Debugf("%s: clientReadLoop removed clientId = %s", msgr.connId(conn), clientId)
 			if err.Error() == "EOF" {
-				msgr.Infof("%s: Client disconnected.", msgr.hostId)
+				msgr.Infof("%s: Client %s disconnected.", msgr.hostId, clientId)
 			} else {
 				msgr.Errorf("%s: Failed to read from client. Disconnecting.", msgr.hostId)
 			}
 
-			conn.Close()
+			if conn != nil {
+				conn.Close()
+			}
 			return
 		}
 
@@ -634,7 +595,7 @@ func (msgr *messenger) serverReadLoop(serverId hostId) {
 			msgr.removeServer(serverId)
 			msgr.Debugf("%s: serverReadLoop.3 removed serverId = %s", msgr.connId(conn), serverId)
 			if err.Error() == "EOF" {
-				msgr.Infof("%s: Server disconnected.", msgr.hostId)
+				msgr.Infof("%s: Server %s disconnected.", msgr.hostId, serverId)
 			} else {
 				msgr.Errorf("%s: Failed to read from server (%v). Disconnecting.", msgr.connId(conn), err)
 			}
@@ -643,7 +604,7 @@ func (msgr *messenger) serverReadLoop(serverId hostId) {
 				conn.Close()
 			}
 
-			msgr.addPendingDial(serverId)
+			go msgr.dial(serverId)
 			return
 		}
 
@@ -745,7 +706,10 @@ func (msgr *messenger) Publish(_topic string, body []byte) error {
 			continue
 		}
 
-		return msgr.writeMessage(conn, msg)
+		err := msgr.writeMessage(conn, msg)
+		if err == nil {
+			return nil
+		}
 	}
 }
 
@@ -830,15 +794,12 @@ func (msgr *messenger) Request(_topic string, body []byte, timeout time.Duration
 }
 
 func (msgr *messenger) selectTopicServer(t topic) hostId {
-	msgr.Debugf("%s: selectTopicServer.10: topic = %s", msgr.hostId, t)
 	serverIds := msgr.getServerIdsByTopic(t)
-	msgr.Debugf("%s: selectTopicServer.20: servers = %s", msgr.hostId, serverIds)
 	if len(serverIds) == 0 {
-		msgr.Debugf("%s: selectTopicServer.30: no servers", msgr.hostId)
 		return ""
 	}
 	serverId := serverIds[mRand.Intn(len(serverIds))]
-	msgr.Debugf("%s: selectTopicServer.90: servers = %s", msgr.hostId, serverId)
+	// msgr.Infof("selectTopicServer: servers[%d] = %s", len(serverIds), serverId)
 	return serverId
 }
 
@@ -937,8 +898,10 @@ func (mType messageType) String() string {
 		return "request"
 	case reply:
 		return "reply"
-	case join:
-		return "join"
+	case joinInvite:
+		return "joinInvite"
+	case joinAccept:
+		return "joinAccept"
 	case leave:
 		return "leave"
 	case subscribe:
@@ -978,4 +941,15 @@ func (msg *message) String() string {
 
 func (pr *replyMessage) String() string {
 	return fmt.Sprintf("[replyMessage: msg: %s; code: %s]", pr.message, pr.replyCode)
+}
+
+func resolveAddr(addr string) (hostId, error) {
+	resolved, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil {
+		return "", err
+	}
+	if resolved.IP == nil {
+		return hostId(fmt.Sprintf("127.0.0.1:%d", resolved.Port)), nil
+	}
+	return hostId(resolved.String()), nil
 }
