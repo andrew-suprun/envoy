@@ -9,15 +9,19 @@ import (
 	"github.com/ugorji/go/codec"
 	mRand "math/rand"
 	"net"
+	"runtime/debug"
 	"sync"
 	"time"
 )
 
 var (
-	FailedToJoinError  = errors.New("failed to join")
-	TimeoutError       = errors.New("timed out")
-	NoSubscribersError = errors.New("no subscribers")
-	NilConnError       = errors.New("null connection")
+	FailedToJoinError       = errors.New("failed to join")
+	ServerDisconnectedError = errors.New("server disconnected")
+	TimeoutError            = errors.New("timed out")
+	NoSubscribersError      = errors.New("no subscribers found")
+	NoHandlerError          = errors.New("no handler for topic found")
+	NilConnError            = errors.New("null connection")
+	PanicError              = errors.New("server panic-ed")
 )
 
 var RedialInterval = 10 * time.Second
@@ -49,16 +53,12 @@ const (
 	publish messageType = iota
 	request
 	reply
+	replyPanic
 	joinInvite
 	joinAccept
 	leaving
 	subscribe
 	unsubscribe
-)
-
-const (
-	ok replyCode = iota
-	disconnected
 )
 
 const (
@@ -72,7 +72,6 @@ type (
 	messageType    int
 	handlers       map[topic]Handler
 	pendingReplies map[messageId]chan *replyMessage
-	replyCode      int
 )
 
 type messenger struct {
@@ -146,7 +145,7 @@ type message struct {
 
 type replyMessage struct {
 	*message
-	replyCode
+	error
 }
 
 // type joinInviteBody struct {
@@ -322,7 +321,7 @@ func (msgr *messenger) removeServer(serverId hostId) {
 	server.Lock()
 	if server != nil {
 		for _, replyChan := range server.pendingReplies {
-			replyChan <- &replyMessage{replyCode: disconnected}
+			replyChan <- &replyMessage{error: ServerDisconnectedError}
 		}
 	}
 	if server.conn != nil {
@@ -662,7 +661,7 @@ func (msgr *messenger) serverReadLoop(serverId hostId) {
 		}
 
 		switch msg.MessageType {
-		case reply:
+		case reply, replyPanic:
 			go msgr.handleReply(serverId, msg)
 		case subscribe, unsubscribe:
 			go msgr.handleSubscription(serverId, msg)
@@ -681,15 +680,22 @@ func (msgr *messenger) handleRequest(clientId hostId, msg *message) {
 		return
 	}
 
-	result := handler(string(msg.Topic), msg.Body)
+	result, err := msgr.runHandler(string(msg.Topic), msg.Body, handler)
+	msgr.Debugf("%s: runHandler returned: result = %s; err = %+v", msgr.hostId, string(result), err)
 	if msg.MessageType == publish {
 		return
 	}
+
 	reply := &message{
 		MessageId:   msg.MessageId,
 		MessageType: reply,
 		Body:        result,
 	}
+
+	if err == PanicError {
+		reply.MessageType = replyPanic
+	}
+
 	conn := msgr.getClientConn(clientId)
 	if conn == nil {
 		msgr.Errorf("Lost connection to %s. Message is ignored.", clientId)
@@ -698,8 +704,23 @@ func (msgr *messenger) handleRequest(clientId hostId, msg *message) {
 	msgr.writeMessage(conn, reply)
 }
 
+func (msgr *messenger) runHandler(topic string, body []byte, handler Handler) (result []byte, err error) {
+	defer func() {
+		recErr := recover()
+		if recErr != nil {
+			msgr.Panic(recErr, string(debug.Stack()))
+			result = nil
+			err = PanicError
+		}
+	}()
+
+	result = handler(topic, body)
+	msgr.Debugf("%s: runHandler: err = %v", msgr.hostId, err)
+	return result, err
+}
+
 func (msgr *messenger) handleLeaving(serverId hostId) {
-	msgr.Debugf("%s: handleRequest: received leaving message")
+	msgr.Debugf("%s: handleRequest: received leaving message", msgr.hostId)
 	msgr.setServerState(serverId, serverLeaving)
 	// TODO: Graceful shutdown
 }
@@ -711,7 +732,12 @@ func (msgr *messenger) handleReply(serverId hostId, msg *message) {
 		return
 	}
 
-	pending <- &replyMessage{message: msg, replyCode: ok}
+	msgr.Debugf("%s: handleReply: msg = %+v", msgr.hostId, msg)
+	if msg.MessageType == replyPanic {
+		pending <- &replyMessage{message: msg, error: PanicError}
+	} else {
+		pending <- &replyMessage{message: msg}
+	}
 }
 
 func (msgr *messenger) handleSubscription(serverId hostId, msg *message) {
@@ -863,15 +889,13 @@ func (msgr *messenger) Request(_topic string, body []byte, timeout time.Duration
 				msgr.removeReplyChan(serverId, msg.MessageId)
 				return nil, TimeoutError
 			case reply := <-replyChan:
-				switch reply.replyCode {
-				case ok:
-					msgr.removeReplyChan(serverId, msg.MessageId)
-					return reply.message.Body, nil
-				case disconnected:
+				msgr.Debugf("%s: Request: reply = %+v", msgr.hostId, reply)
+				if reply.error == ServerDisconnectedError {
 					msgr.removeReplyChan(serverId, msg.MessageId)
 					continue
-				default:
-					panic("unknown replyCode")
+				} else {
+					msgr.removeReplyChan(serverId, msg.MessageId)
+					return reply.message.Body, reply.error
 				}
 			}
 
@@ -987,6 +1011,8 @@ func (mType messageType) String() string {
 		return "request"
 	case reply:
 		return "reply"
+	case replyPanic:
+		return "replyPanic"
 	case joinInvite:
 		return "joinInvite"
 	case joinAccept:
@@ -999,17 +1025,6 @@ func (mType messageType) String() string {
 		return "unsubscribe"
 	default:
 		panic(fmt.Errorf("Unknown messageType %d", mType))
-	}
-}
-
-func (c replyCode) String() string {
-	switch c {
-	case ok:
-		return "OK"
-	case disconnected:
-		return "disconnected"
-	default:
-		return "unknown"
 	}
 }
 
@@ -1029,7 +1044,7 @@ func (msg *message) String() string {
 }
 
 func (pr *replyMessage) String() string {
-	return fmt.Sprintf("[replyMessage: msg: %s; code: %s]", pr.message, pr.replyCode)
+	return fmt.Sprintf("[replyMessage: msg: %s; err = %v]", pr.message, pr.error)
 }
 
 func resolveAddr(addr string) (hostId, error) {

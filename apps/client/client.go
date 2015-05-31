@@ -88,7 +88,7 @@ func run() {
 				}
 				if err == nil {
 					c := atomic.AddInt64(&okCount, 1)
-					if c%2000 == 0 {
+					if c%1000 == 0 {
 						ts := time.Now()
 						log.Println(c, ts.Sub(timestamp))
 						timestamp = ts
