@@ -1,13 +1,15 @@
 package messenger
 
 import (
-	"fmt"
+	"errors"
 	"log"
 	"net"
 	"sync"
 	"testing"
 	"time"
 )
+
+var testError = errors.New("test error")
 
 func TestSimpleOneOnOne(t *testing.T) {
 	log.Println("---------------- TestSimpleOneOnOne ----------------")
@@ -54,13 +56,13 @@ func TestTwoOnTwo(t *testing.T) {
 	client2.Join("localhost:40001", "localhost:50000")
 
 	c := 0
-	server2.(*messenger).testReadMessage = func(conn net.Conn) {
+	readMessage = func(conn net.Conn) (*message, error) {
 		c++
-		if c > 10 {
+		if c%10 == 0 {
 			log.Printf("--- closing connection %s:%s ---", conn.RemoteAddr(), conn.LocalAddr())
 			conn.Close()
-			c = 0
 		}
+		return _readMessage(conn)
 	}
 
 	c1s1, c1s2, c2s1, c2s2 := 0, 0, 0, 0
@@ -113,64 +115,6 @@ func TestTwoOnTwo(t *testing.T) {
 	log.Printf("counts: c1s1: %d, c1s2: %d, c2s1: %d, c2s2: %d", c1s1, c1s2, c2s1, c2s2)
 	if c1s1 < 25 || c1s2 < 25 || c2s1 < 25 || c2s2 < 25 || c1s1+c1s2 != 100 || c2s1+c2s2 != 100 {
 		t.Errorf("Wrong counts")
-	}
-}
-
-func XXX_TestReconnect(t *testing.T) {
-	log.Println("---------------- TestReconnect ----------------")
-
-	server1 := NewMessenger()
-	defer server1.Leave()
-	server1.Subscribe("job", echo1)
-	server1.Join("localhost:50000")
-	log.Println(">>> server 1 is up.")
-
-	server2 := NewMessenger()
-	defer server2.Leave()
-	server2.Subscribe("job", echo2)
-	server2.Join("localhost:50001", "localhost:50000")
-	log.Println(">>> server 2 is up.")
-
-	client := NewMessenger()
-	defer client.Leave()
-	client.Join("localhost:40000", "localhost:50000")
-	log.Println(">>> client is up.")
-
-	c, s1, s2 := 0, 0, 0
-	server2.(*messenger).testReadMessage = func(conn net.Conn) {
-		c++
-		if c > 10 {
-			log.Printf("### testReadMessage: closing %s/%s", conn.LocalAddr(), conn.RemoteAddr())
-			conn.Close()
-			c = 0
-		}
-	}
-
-	for i := 1; i <= 100; i++ {
-		msg := []byte(fmt.Sprintf("Hello #%d", i))
-		log.Printf("request '%s'", msg)
-		reply, _, err := client.Request("job", msg, time.Second)
-		rep := string(reply)
-		log.Printf("response '%s'", rep)
-		if err != nil {
-			t.Errorf("Request returned error: %s", err)
-			break
-		}
-		switch rep[:14] {
-		case "server:1 Hello":
-			s1++
-		case "server:2 Hello":
-			s2++
-		default:
-			t.Errorf("Expected: 'Hello'; received '%s'", string(reply))
-			break
-		}
-	}
-
-	log.Printf("counts: s1: %d, s2: %d", s1, s2)
-	if s1+s2 != 100 || s1 < 30 || s2 < 30 {
-		log.Printf("### Wrong counts.1: %d/%d", s1, s2)
-		t.Fatalf("Wrong counts")
 	}
 }
 

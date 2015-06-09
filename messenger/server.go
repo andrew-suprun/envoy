@@ -1,192 +1,100 @@
 package messenger
 
 import (
+	"bytes"
 	"github.com/andrew-suprun/envoy/actor"
 	"net"
+	"time"
 )
+
+type pendingReplies map[messageId]chan *actorMessage
 
 type server struct {
 	actor.Actor
 	hostId
-	conn net.Conn
-	msgr actor.Actor
 	pendingReplies
+	reader  actor.Actor
+	writer  actor.Actor
+	msgr    actor.Actor
+	stopped bool
 }
 
-func newServer(serverId hostId, msgr actor.Actor) actor.Actor {
+func newServer(serverId hostId, conn net.Conn, msgr actor.Actor) actor.Actor {
 	srv := &server{
 		hostId:         serverId,
-		Actor:          actor.NewActor("server"),
+		Actor:          actor.NewActor("server-" + string(serverId)),
 		pendingReplies: make(pendingReplies),
-		in:             make(chan serverMessage),
 		msgr:           msgr,
 	}
+
+	srv.reader = newReader("server-reader-"+string(serverId), conn, srv)
+	srv.writer = newWriter("server-writer-"+string(serverId), conn, srv)
+
 	return srv.
-		RegisterHandler("message", srv.handleMessage).
-		RegisterHandler("subscribe", srv.handleSubscribe).
-		RegisterHandler("un-subscribe", srv.handleUnubscribe).
 		RegisterHandler("publish", srv.handlePublish).
+		RegisterHandler("request", srv.handleRequest).
 		RegisterHandler("reply", srv.handleReply).
-		RegisterHandler("stop", srv.handleStop).
 		Start()
 }
 
-func (srv *server) handleStart(_ actor.MessageType, _ actor.Payload) {
-	srv.dial()
-	go srv.readLoop()
-}
-
-func (srv *server) readLoop() {
-	for {
-		msg, err := readMessage(srv.conn)
-		if err != nil {
-			msgr.Send("server-gone", srv.hostId)
-			if err.Error() == "EOF" {
-				Log.Debugf("%s: Client %s disconnected.", msgr.hostId, clientId)
-			} else {
-				Log.Errorf("%s: Failed to read from client. Disconnecting.", msgr.hostId)
-			}
-			srv.stop()
-			return
-		}
-
-		switch msg.MessageType {
-		case publish, request:
-			go msgr.handleRequest(clientId, msg)
-		default:
-			panic(fmt.Errorf("Read unknown client message type %s", msg.MessageType))
-		}
-	}
-}
-
-func (srv *server) dial() {
+func (srv *server) start() {
 	for !srv.stopped {
-		conn, err := net.Dial("tcp", string(serverId))
+		conn, err := net.Dial("tcp", string(srv.hostId))
 		if err != nil {
-			log.Errorf("%s: Failed to connect to '%s'. Will re-try.", msgr.hostId, serverId)
+			Log.Errorf("Failed to connect to '%s'. Will re-try.", srv.hostId)
 			time.Sleep(RedialInterval)
 			continue
 		}
 
-		err = writeJoinInvite(conn)
+		err = writeJoinInvite(srv.hostId, conn)
 		if err != nil {
-			log.Errorf("%s: Failed to invite '%s'. Will re-try.", msgr.hostId, serverId)
+			Log.Errorf("Failed to invite '%s'. Will re-try.", srv.hostId)
 			time.Sleep(RedialInterval)
 			continue
 		}
 
 		reply, err := readJoinAccept(conn)
 		if err != nil {
-			log.Errorf("Failed to read join accept from '%s'. Will re-try.", conn)
+			Log.Errorf("Failed to read join accept from '%s'. Will re-try.", conn)
 			time.Sleep(RedialInterval)
 			continue
 		}
 
-		srv.conn = conn
 		srv.msgr.Send("got-peers", reply.Peers)
 		return
 	}
 }
 
-func (srv *server) message(msg *message, err error) {
-	if err != nil {
-		go srv.msgr.readError(srv.hostId, err)
-		return
-	}
-	switch msg.MessageType {
-	case reply, replyPanic:
-		srv.handleReply(msg)
-	case subscribe, unsubscribe:
-		srv.handleSubscription(msg)
-	case leaving:
-		srv.handleLeaving()
-	default:
-		panic(fmt.Errorf("Read unknown client message type %s", msg.MessageType))
-	}
+func (srv *server) handlePublish(_ actor.MessageType, info actor.Payload) {
+	srv.writer.Send("message", info)
 }
 
-func (srv *server) hasTopic(_topic topic) bool {
-	respChan := make(chan bool)
-	srv.in <- hasTopicMessage{topic: _topic, responseChan: respChan}
-	return <-respChan
+func (srv *server) handleRequest(_ actor.MessageType, info actor.Payload) {
+	cmd := info.(*requestCommand)
+	srv.pendingReplies[cmd.MessageId] = cmd.replyChan
+	srv.writer.Send("message", cmd.message)
 }
 
-func (srv *server) handleLeaving(serverId hostId) {
-	srv.stop()
-	go srv.msgr.serverGone(srv.hostId)
-}
-
-func (srv *server) handleReply(serverId hostId, msg *message) {
-	pending := srv.pendingReplies[msg.MessageId]
-	if pending == nil {
-		Log.Errorf("Received unexpected message '%s'. Ignored.", msg.MessageType)
-		return
+func (srv *server) handleReply(_ actor.MessageType, info actor.Payload) {
+	msg := info.(*actorMessage)
+	replyChan := srv.pendingReplies[msg.MessageId]
+	if replyChan == nil {
+		Log.Errorf("Received unexpected reply. Ignoring.")
 	}
-
-	if msg.MessageType == replyPanic {
-		pending <- &actorMessage{message: msg, error: PanicError}
-	} else {
-		pending <- &actorMessage{message: msg}
-	}
-}
-
-func (srv *server) handleSubscription(serverId hostId, msg *message) {
-
-	buf := bytes.NewBuffer(msg.Body)
-	var _topic topic
-	decode(buf, &_topic)
-
-	switch msg.MessageType {
-	case subscribe:
-		msgr.addServerTopic(serverId, _topic)
-	case unsubscribe:
-		msgr.removeServerTopic(serverId, _topic)
-	default:
-		panic("Wrong message type for handleSubscription")
-	}
-}
-
-func (srv *server) leave() {
-
-	srv.wg.Wait()
-
-}
-
-func (srv *server) shutdown() {
-	// todo
-	if server != nil {
-		for _, replyChan := range server.pendingReplies {
-			replyChan <- &actorMessage{error: ServerDisconnectedError}
-		}
-	}
-	if server.conn != nil {
-		server.conn.Close()
-	}
-}
-
-func sliceTopics(topicMap map[topic]struct{}) []topic {
-	result := make([]topic, len(topicMap))
-	for topic := range topicMap {
-		result = append(result, topic)
-	}
-	return result
-}
-
-func mapTopics(topicSlice []topic) map[topic]struct{} {
-	result := make(map[topic]struct{}, len(topicSlice))
-	for _, topic := range topicSlice {
-		result[topic] = struct{}{}
-	}
-	return result
+	replyChan <- msg
 }
 
 func (srv *server) stop() {
-	close(srv.in)
+	for _, replyChan := range srv.pendingReplies {
+		replyChan <- &actorMessage{error: ServerDisconnectedError}
+	}
+	srv.writer.Stop()
+	srv.reader.Stop()
 }
 
-func writeJoinInvite(conn net.Conn) error {
+func writeJoinInvite(hostId hostId, conn net.Conn) error {
 	buf := &bytes.Buffer{}
-	encode(msgr.hostId, buf)
+	encode(hostId, buf)
 	return writeMessage(conn, &message{MessageId: newId(), MessageType: joinInvite, Body: buf.Bytes()})
 }
 

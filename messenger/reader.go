@@ -7,41 +7,40 @@ import (
 
 type reader struct {
 	actor.Actor
-	conn      *net.Conn
+	net.Conn
 	recipient actor.Actor
 	stopped   bool
 }
 
-func newReader(conn net.Conn, recipient actor.Actor) actor.Actor {
+func newReader(name string, conn net.Conn, recipient actor.Actor) actor.Actor {
 	reader := &reader{
-		reader:    actor.NewActor("reader"),
-		conn:      conn,
+		Actor:     actor.NewActor(name),
+		Conn:      conn,
 		recipient: recipient,
 	}
 
 	reader.run()
 
-	return reader.
-		RegisterHandler("stop", reader.handleStop).
-		Start()
-}
-
-func (rdr *reader) handleStop(_ actor.MessageType, _ actor.Payload) {
-	if !rdr.stopped {
-		rdr.stopped = true
-		rdr.Stop()
-		rdr.conn.Close()
-	}
+	return reader.Start()
 }
 
 func (rdr *reader) run() {
 	for !rdr.stopped {
-		msg, err := readMessage(rdr.conn)
-
-		rdr.recipientSend("message", &actorMessage{msg, err})
+		msg, err := readMessage(rdr.Conn)
+		rdr.recipient.Send("message", &actorMessage{msg, err})
 
 		if err != nil {
 			rdr.stop()
+			return
 		}
 	}
+}
+
+func (rdr *reader) stop() {
+	if !rdr.stopped {
+		rdr.stopped = true
+		rdr.Stop()
+		rdr.Close()
+	}
+	// todo: graceful shutdown
 }

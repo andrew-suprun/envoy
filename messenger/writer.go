@@ -7,15 +7,15 @@ import (
 
 type writer struct {
 	actor.Actor
-	conn      *net.Conn
+	net.Conn
 	recipient actor.Actor
 	stopped   bool
 }
 
-func newWriter(conn net.Conn, recipient actor.Actor) actor.Actor {
+func newWriter(name string, conn net.Conn, recipient actor.Actor) actor.Actor {
 	writer := &writer{
-		writer:    actor.NewActor("writer"),
-		conn:      conn,
+		Actor:     actor.NewActor(name),
+		Conn:      conn,
 		recipient: recipient,
 	}
 
@@ -26,24 +26,12 @@ func newWriter(conn net.Conn, recipient actor.Actor) actor.Actor {
 }
 
 func (writer *writer) handleMessage(_ actor.MessageType, info actor.Payload) {
-	writeMessage(writer.conn, info.(*message))
+	writeMessage(writer.Conn, info.(*message))
 }
 
 func (writer *writer) handleStop(_ actor.MessageType, _ actor.Payload) {
 	if !writer.stopped {
 		writer.stopped = true
 		writer.Stop()
-	}
-}
-
-func (writer *writer) run() {
-	for !writer.stopped {
-		msg, err := readMessage(writer.conn)
-
-		writer.recipientSend("message", &actorMessage{msg, err})
-
-		if err != nil {
-			writer.stop()
-		}
 	}
 }

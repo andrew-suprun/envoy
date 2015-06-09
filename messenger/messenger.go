@@ -63,23 +63,23 @@ const (
 )
 
 type (
-	topic          string
-	hostId         string
-	messageId      [messageIdSize]byte
-	messageType    int
-	pendingReplies map[messageId]chan *actorMessage
+	topic       string
+	hostId      string
+	messageId   [messageIdSize]byte
+	messageType int
 )
 
 type messenger struct {
 	actor.Actor
 	hostId
 	subscriptions map[topic]Handler
-	servers       map[hostId]*serverTopics
+	servers       map[hostId]*serverActor
 	clients       map[hostId]actor.Actor
 	listener      actor.Actor
 }
 
-type serverTopics struct {
+type serverActor struct {
+	hostId
 	actor.Actor
 	topics map[topic]struct{}
 }
@@ -116,6 +116,11 @@ type messageCommand struct {
 	writer actor.Actor
 }
 
+type requestCommand struct {
+	*message
+	replyChan chan *actorMessage
+}
+
 type joinAcceptBody struct {
 	Topics []topic  `codec:"t,omitempty"`
 	Peers  []hostId `codec:"p,omitempty"`
@@ -131,7 +136,7 @@ func NewMessenger() Messenger {
 		Actor:         actor.NewActor("messenger"),
 		subscriptions: make(map[topic]Handler),
 		clients:       make(map[hostId]actor.Actor),
-		servers:       make(map[hostId]*serverTopics),
+		servers:       make(map[hostId]*serverActor),
 	}
 	msgr.
 		RegisterHandler("join", msgr.handleJoin).
@@ -389,47 +394,34 @@ func (msgr *messenger) Request(_topic string, body []byte, timeout time.Duration
 		if server == nil {
 			return []byte{}, msg.MessageId, NoSubscribersError
 		}
-		server.Send("message", msg)
-
-		replyChan := msgr.setReplyChan(serverId, msg.MessageId)
-		err := writeMessage(conn, msg)
-
-		if err == nil {
-			select {
-			case <-timeoutChan:
-				msgr.removeReplyChan(serverId, msg.MessageId)
-				return nil, msg.MessageId, TimeoutError
-			case reply := <-replyChan:
-				if reply.error == ServerDisconnectedError {
-					msgr.removeReplyChan(serverId, msg.MessageId)
-					continue
-				} else {
-					msgr.removeReplyChan(serverId, msg.MessageId)
-					return reply.message.Body, msg.MessageId, reply.error
-				}
+		replyChan := make(chan *actorMessage)
+		server.Send("request", &requestCommand{msg, replyChan})
+		select {
+		case <-timeoutChan:
+			return nil, msg.MessageId, TimeoutError
+		case reply := <-replyChan:
+			if reply.error == ServerDisconnectedError {
+				delete(msgr.servers, server.hostId)
+				continue
 			}
-
-		} else {
-			msgr.removeReplyChan(serverId, msg.MessageId)
-			continue
+			return reply.message.Body, msg.MessageId, reply.error
 		}
 	}
 }
 
-func (msgr *messenger) selectTopicServer(t topic) actor.Actor {
-	serverIds := msgr.getServersByTopic(t)
-	if len(serverIds) == 0 {
-		return ""
+func (msgr *messenger) selectTopicServer(t topic) *serverActor {
+	servers := msgr.getServersByTopic(t)
+	if len(servers) == 0 {
+		return nil
 	}
-	serverId := serverIds[mRand.Intn(len(serverIds))]
-	return serverId
+	return servers[mRand.Intn(len(servers))]
 }
 
-func (msgr *messenger) getServersByTopic(t topic) []actor.Actor {
-	result := []actor.Actor{}
+func (msgr *messenger) getServersByTopic(t topic) []*serverActor {
+	result := []*serverActor{}
 	for _, server := range msgr.servers {
 		if _, found := server.topics[t]; found {
-			result = append(result, server.Actor)
+			result = append(result, server)
 		}
 	}
 	return result
@@ -484,8 +476,8 @@ func (h *client) String() string {
 	return fmt.Sprintf("[client: id: %s]", h.hostId)
 }
 
-func (h *server) String() string {
-	return fmt.Sprintf("[server: id: %s; topics %d; pendingReplies %d]", h.hostId, len(h.topics), len(h.pendingReplies))
+func (h *serverActor) String() string {
+	return fmt.Sprintf("[server: id: %s; topics %d]", h.hostId, len(h.topics))
 }
 
 func (msg *message) String() string {
@@ -513,16 +505,6 @@ func resolveAddr(addr string) (hostId, error) {
 	return hostId(resolved.String()), nil
 }
 
-func (msgr *messenger) getClientConn(clientId hostId) (result net.Conn) {
-	msgr.clients.Mutex.Lock()
-	client, ok := msgr.clients.hosts[clientId]
-	if ok {
-		result = client.conn
-	}
-	msgr.clients.Unlock()
-	return result
-}
-
 func (msgr *messenger) stop() {
-	close(msgr.in)
+	msgr.Stop()
 }

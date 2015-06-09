@@ -19,12 +19,10 @@ type Payload interface{}
 type Handler func(MessageType, Payload)
 
 func NewActor(name string) Actor {
-	mu := sync.Mutex{}
 	return &actor{
 		name:     name,
 		handlers: make(map[MessageType]Handler),
-		Mutex:    mu,
-		Cond:     sync.NewCond(&mu),
+		Cond:     sync.NewCond(&sync.Mutex{}),
 	}
 }
 
@@ -32,7 +30,6 @@ type actor struct {
 	name     string
 	handlers map[MessageType]Handler
 	pending  []message
-	sync.Mutex
 	*sync.Cond
 	stopped bool
 }
@@ -54,23 +51,23 @@ func (a *actor) Start() Actor {
 
 func (a *actor) run() {
 	for {
-		a.Lock()
-		a.Wait()
+		a.Cond.L.Lock()
+		a.Cond.Wait()
 
 		if a.stopped {
-			a.Unlock()
+			a.Cond.L.Unlock()
 			return
 		}
 
 		if len(a.pending) == 0 {
-			a.Unlock()
+			a.Cond.L.Unlock()
 			continue
 		}
 
 		msg := a.pending[0]
 		a.pending = a.pending[1:]
 
-		a.Unlock()
+		a.Cond.L.Unlock()
 
 		h, found := a.handlers[msg.MessageType]
 		if !found {
@@ -81,15 +78,15 @@ func (a *actor) run() {
 }
 
 func (a *actor) Send(msgType MessageType, info Payload) Actor {
-	a.Lock()
+	a.Cond.L.Lock()
 	a.pending = append(a.pending, message{msgType, info})
 	a.Cond.Signal()
-	a.Unlock()
+	a.Cond.L.Unlock()
 	return a
 }
 
 func (a *actor) Stop() {
-	a.Lock()
+	a.Cond.L.Lock()
 	a.stopped = true
-	a.Unlock()
+	a.Cond.L.Unlock()
 }

@@ -16,16 +16,17 @@ type client struct {
 	stopped  bool
 }
 
-func newClient(clientId hostId, conn net.Conn) actor.Actor {
+func newClient(clientId hostId, conn net.Conn, msgr actor.Actor) actor.Actor {
 	client := &client{
 		hostId: clientId,
+		Actor:  actor.NewActor("client-" + string(clientId)),
+		msgr:   msgr,
 	}
-	client.reader = newReader(conn, client)
-	client.writer = newWriter(conn, client)
+	client.reader = newReader("client-reader-"+string(clientId), conn, client)
+	client.writer = newWriter("client-writer-"+string(clientId), conn, client)
 
 	return client.
 		RegisterHandler("message", client.handleMessage).
-		RegisterHandler("stop", client.handleStop).
 		Start()
 }
 
@@ -36,7 +37,4 @@ func (client *client) handleMessage(msgType actor.MessageType, info actor.Payloa
 	}
 
 	client.msgr.Send("message", &messageCommand{info, client.writer})
-}
-
-func (client *client) handleStop(_ actor.MessageType, _ actor.Payload) {
 }
