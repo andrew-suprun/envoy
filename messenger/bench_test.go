@@ -36,7 +36,7 @@ func Benchmark1(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			atomic.AddInt64(&c, 1)
-			reply, err := client.Request("job", body, time.Second)
+			reply, _, err := client.Request("job", body, time.Second)
 			if err != nil {
 				b.Fatalf("Request returned an error: %v", err)
 			}

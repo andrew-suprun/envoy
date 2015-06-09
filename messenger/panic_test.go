@@ -12,16 +12,16 @@ func TestPanic(t *testing.T) {
 	server := NewMessenger()
 	defer server.Leave()
 	server.Subscribe("job", panicingHandler)
-	server.Join("localhost:50000", "localhost:20000")
+	server.Join("localhost:50000")
 
 	client := NewMessenger()
 	defer client.Leave()
 	client.Join("localhost:40000", "localhost:50000")
 
-	reply, err := client.Request("job", []byte("Hello"), time.Second)
+	reply, _, err := client.Request("job", []byte("Hello"), time.Second)
 	log.Printf("TestPanic: reply = %s; err = %v", string(reply), err)
 	if err != PanicError {
-		t.Fatalf("Server didn't panic", err)
+		t.Fatalf("Server didn't panic")
 	}
 }
 

@@ -9,22 +9,20 @@ type Logger interface {
 	Panic(err interface{}, stack string)
 }
 
-type _defaultLogger struct{}
+type defaultLogger struct{}
 
-func (l _defaultLogger) Debugf(format string, v ...interface{}) {
+func (l defaultLogger) Debugf(format string, v ...interface{}) {
 	log.Printf("DEBUG: "+format, v...)
 }
 
-func (l _defaultLogger) Infof(format string, v ...interface{}) {
+func (l defaultLogger) Infof(format string, v ...interface{}) {
 	log.Printf("INFO:  "+format, v...)
 }
 
-func (l _defaultLogger) Errorf(format string, v ...interface{}) {
+func (l defaultLogger) Errorf(format string, v ...interface{}) {
 	log.Printf("ERROR: "+format, v...)
 }
 
-func (l _defaultLogger) Panic(err interface{}, stack string) {
+func (l defaultLogger) Panic(err interface{}, stack string) {
 	log.Printf("PANIC: %v\nStack:\n%s", err, stack)
 }
-
-var defaultLogger _defaultLogger

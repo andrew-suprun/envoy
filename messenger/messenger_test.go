@@ -22,7 +22,7 @@ func TestSimpleOneOnOne(t *testing.T) {
 	client.Join("localhost:40000", "localhost:50000")
 
 	for i := 0; i < 20; i++ {
-		reply, err := client.Request("job", []byte("Hello"), time.Second)
+		reply, _, err := client.Request("job", []byte("Hello"), time.Second)
 		if err != nil {
 			t.Fatalf("Request returned error: %s", err)
 		}
@@ -57,9 +57,10 @@ func TestTwoOnTwo(t *testing.T) {
 	server2.(*messenger).testReadMessage = func(conn net.Conn) {
 		c++
 		if c > 10 {
+			log.Printf("--- closing connection %s:%s ---", conn.RemoteAddr(), conn.LocalAddr())
 			conn.Close()
+			c = 0
 		}
-		c = 0
 	}
 
 	c1s1, c1s2, c2s1, c2s2 := 0, 0, 0, 0
@@ -67,8 +68,9 @@ func TestTwoOnTwo(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		for i := 0; i < 100; i++ {
-			reply, err := client1.Request("job", []byte("Hello1"), time.Second)
+			reply, _, err := client1.Request("job", []byte("Hello1"), time.Second)
 			rep := string(reply)
+			log.Println(rep)
 			if err != nil {
 				t.Errorf("Request returned error: %s", err)
 				break
@@ -88,8 +90,9 @@ func TestTwoOnTwo(t *testing.T) {
 
 	go func() {
 		for i := 0; i < 100; i++ {
-			reply, err := client2.Request("job", []byte("Hello2"), time.Second)
+			reply, _, err := client2.Request("job", []byte("Hello2"), time.Second)
 			rep := string(reply)
+			log.Println(rep)
 			if err != nil {
 				t.Errorf("Request returned error: %s", err)
 				break
@@ -146,7 +149,7 @@ func XXX_TestReconnect(t *testing.T) {
 	for i := 1; i <= 100; i++ {
 		msg := []byte(fmt.Sprintf("Hello #%d", i))
 		log.Printf("request '%s'", msg)
-		reply, err := client.Request("job", msg, time.Second)
+		reply, _, err := client.Request("job", msg, time.Second)
 		rep := string(reply)
 		log.Printf("response '%s'", rep)
 		if err != nil {
