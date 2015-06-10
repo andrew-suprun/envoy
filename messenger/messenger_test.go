@@ -14,14 +14,22 @@ var testError = errors.New("test error")
 func TestSimpleOneOnOne(t *testing.T) {
 	log.Println("---------------- TestSimpleOneOnOne ----------------")
 
-	server := NewMessenger()
+	server, err := NewMessenger("localhost:50000")
+	if err != nil {
+		t.FailNow()
+	}
 	defer server.Leave()
 	server.Subscribe("job", echo)
-	server.Join("localhost:50000", "localhost:20000")
+	server.Join("localhost:20000")
 
-	client := NewMessenger()
+	client, err := NewMessenger("localhost:40000")
+	if err != nil {
+		t.FailNow()
+	}
 	defer client.Leave()
-	client.Join("localhost:40000", "localhost:50000")
+	client.Join("localhost:50000")
+
+	time.Sleep(time.Second)
 
 	for i := 0; i < 20; i++ {
 		reply, _, err := client.Request("job", []byte("Hello"), time.Second)
@@ -37,23 +45,35 @@ func TestSimpleOneOnOne(t *testing.T) {
 func TestTwoOnTwo(t *testing.T) {
 	log.Println("---------------- TestTwoOnTwo ----------------")
 
-	server1 := NewMessenger()
+	server1, err := NewMessenger("localhost:50000")
+	if err != nil {
+		t.FailNow()
+	}
 	defer server1.Leave()
 	server1.Subscribe("job", echo1)
-	server1.Join("localhost:50000")
+	server1.Join()
 
-	server2 := NewMessenger()
+	server2, err := NewMessenger("localhost:50001")
+	if err != nil {
+		t.FailNow()
+	}
 	defer server2.Leave()
 	server2.Subscribe("job", echo2)
-	server2.Join("localhost:50001", "localhost:50000")
+	server2.Join("localhost:50000")
 
-	client1 := NewMessenger()
+	client1, err := NewMessenger("localhost:40000")
+	if err != nil {
+		t.FailNow()
+	}
 	defer client1.Leave()
-	client1.Join("localhost:40000", "localhost:50000")
+	client1.Join("localhost:50000")
 
-	client2 := NewMessenger()
+	client2, err := NewMessenger("localhost:40001")
+	if err != nil {
+		t.FailNow()
+	}
 	defer client2.Leave()
-	client2.Join("localhost:40001", "localhost:50000")
+	client2.Join("localhost:50000")
 
 	c := 0
 	readMessage = func(conn net.Conn) (*message, error) {

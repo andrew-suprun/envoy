@@ -19,7 +19,9 @@ func newReader(name string, conn net.Conn, recipient actor.Actor) actor.Actor {
 		recipient: recipient,
 	}
 
-	reader.run()
+	reader.RegisterHandler("stop", reader.handleStop)
+
+	go reader.run()
 
 	return reader.Start()
 }
@@ -27,20 +29,18 @@ func newReader(name string, conn net.Conn, recipient actor.Actor) actor.Actor {
 func (rdr *reader) run() {
 	for !rdr.stopped {
 		msg, err := readMessage(rdr.Conn)
-		rdr.recipient.Send("message", &actorMessage{msg, err})
+		rdr.recipient.Send("read", &actorMessage{msg, err})
 
 		if err != nil {
-			rdr.stop()
+			rdr.Stop()
 			return
 		}
 	}
 }
 
-func (rdr *reader) stop() {
+func (rdr *reader) handleStop(_ actor.MessageType, _ actor.Payload) {
 	if !rdr.stopped {
 		rdr.stopped = true
-		rdr.Stop()
 		rdr.Close()
 	}
-	// todo: graceful shutdown
 }

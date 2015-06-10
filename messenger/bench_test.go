@@ -15,16 +15,23 @@ func Benchmark1(b *testing.B) {
 		log.Println("count", c)
 	}()
 
-	server := NewMessenger()
+	server, err := NewMessenger("localhost:55555")
+	if err != nil {
+		b.FailNow()
+	}
 	server.Subscribe("job", func(topic string, body []byte) []byte {
 		// b.Logf("server received topic: '%s' body: '%s'", topic, string(body))
 		return body
 	})
-	server.Join("localhost:55555")
+	server.Join()
 	defer server.Leave()
 
-	client := NewMessenger()
-	err := client.Join("localhost:44444", "localhost:55555")
+	client, err := NewMessenger("localhost:44444")
+	if err != nil {
+		b.FailNow()
+	}
+
+	client.Join("localhost:55555")
 	if err != nil {
 		b.Fatalf("Server failed to join: %v", err)
 	}

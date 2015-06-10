@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/andrew-suprun/envoy/actor"
+	"log"
 	mRand "math/rand"
 	"net"
 	"runtime/debug"
@@ -26,7 +27,7 @@ var RedialInterval = 10 * time.Second
 var Log Logger = &defaultLogger{}
 
 type Messenger interface {
-	Join(local string, remotes ...string) error
+	Join(remotes ...string)
 	Leave()
 
 	Request(topic string, body []byte, timeout time.Duration) ([]byte, MessageId, error)
@@ -111,6 +112,11 @@ type joinAcceptCommand struct {
 	responseChan chan *joinAcceptBody
 }
 
+type joinAcceptReply struct {
+	serverId hostId
+	reply    *joinAcceptBody
+}
+
 type messageCommand struct {
 	info   actor.Payload
 	writer actor.Actor
@@ -119,6 +125,11 @@ type messageCommand struct {
 type requestCommand struct {
 	*message
 	replyChan chan *actorMessage
+}
+
+type errorMessage struct {
+	name string
+	error
 }
 
 type joinAcceptBody struct {
@@ -131,65 +142,84 @@ type subscribeMessageBody struct {
 	Topic  topic  `codec:"t,omitempty"`
 }
 
-func NewMessenger() Messenger {
+func NewMessenger(local string) (Messenger, error) {
+	localAddr, err := resolveAddr(local)
+	if err != nil {
+		return nil, err
+	}
+
 	msgr := &messenger{
-		Actor:         actor.NewActor("messenger"),
+		hostId:        hostId(localAddr),
 		subscriptions: make(map[topic]Handler),
 		clients:       make(map[hostId]actor.Actor),
 		servers:       make(map[hostId]*serverActor),
 	}
-	msgr.
-		RegisterHandler("join", msgr.handleJoin).
-		RegisterHandler("join-accept", msgr.handleJoinAccept).
-		RegisterHandler("message", msgr.handleMessage).
-		RegisterHandler("server-gone", msgr.handleServerGone).
-		RegisterHandler("client-gone", msgr.handleClientGone).
-		Start()
-	return msgr
+
+	msgr.listener, err = newListener(string(msgr.hostId)+"-listener", msgr, localAddr)
+	if err != nil {
+		msgr.stop()
+		return nil, err
+	}
+
+	return msgr, nil
 }
 
-func (msgr *messenger) Join(local string, remotes ...string) error {
-	localAddr, err := resolveAddr(local)
-	if err != nil {
-		return err
-	}
+func (msgr *messenger) Join(remotes ...string) {
 	var remoteAddrs []hostId
 	for _, remote := range remotes {
 		remoteAddr, err := resolveAddr(remote)
 		if err == nil {
-			remoteAddrs = append(remoteAddrs, hostId(remoteAddr))
+			remoteAddrs = append(remoteAddrs, remoteAddr)
 		} else {
 			Log.Errorf("Cannot resolve address %s. Ignoring.", remote)
 		}
 	}
 
-	joinResponseChan := make(chan error)
-	msgr.Send("join", joinCommand{
-		local:        hostId(localAddr),
-		remotes:      remoteAddrs,
-		responseChan: joinResponseChan,
-	})
-	return <-joinResponseChan
-}
+	//
+	//
 
-func (msgr *messenger) handleJoin(_ actor.MessageType, info actor.Payload) {
-	cmd := info.(joinCommand)
-	listener, err := newListener(msgr, cmd.local)
-	if err != nil {
-		msgr.stop()
-		cmd.responseChan <- err
-		return
-	}
-
-	msgr.listener = listener
-
-	for _, remote := range cmd.remotes {
-		msgr.initialDial(hostId(remote))
+	for _, remote := range remoteAddrs {
+		msgr.startServer(remote)
 	}
 
 	// todo: start dialer
 
-	cmd.responseChan <- nil
+	//
+	//
+
+	msgr.Actor = actor.NewActor(string(msgr.hostId)+"-messenger").
+		RegisterHandler("new-client", msgr.handleNewClient).
+		RegisterHandler("join-accept", msgr.handleJoinAccept).
+		RegisterHandler("join-accepted", msgr.handleJoinAccepted).
+		RegisterHandler("message", msgr.handleMessage).
+		RegisterHandler("error", msgr.handleError).
+		// RegisterHandler("server-gone", msgr.handleServerGone).
+		// RegisterHandler("client-gone", msgr.handleClientGone).
+		Start()
+}
+
+func (msgr *messenger) startServer(serverId hostId) {
+	if _, exists := msgr.servers[serverId]; !exists {
+		server := newServer(fmt.Sprintf("%s-%s-server", msgr.hostId, serverId), serverId, msgr)
+		msgr.servers[serverId] = &serverActor{
+			hostId: serverId,
+			Actor:  server,
+			topics: make(map[topic]struct{}),
+		}
+		server.Send("start", nil)
+	}
+}
+
+func (msgr *messenger) handleNewClient(_ actor.MessageType, info actor.Payload) {
+	cmd := info.(*newPeerCommand)
+	msgr.logf("received 'new-client': clientId = %s; conn = %s", cmd.hostId, cmd.Conn.RemoteAddr())
+	if _, exists := msgr.clients[cmd.hostId]; !exists {
+		client := newClient(fmt.Sprintf("%s-%s-client", msgr.hostId, cmd.hostId), cmd.hostId, cmd.Conn, msgr)
+		msgr.clients[cmd.hostId] = client
+		msgr.logf("started new client: clientId = %s; conn = %s", cmd.hostId, cmd.Conn.RemoteAddr())
+	} else {
+		msgr.logf("client already exists: clientId = %s; conn = %s", cmd.hostId, cmd.Conn.RemoteAddr())
+	}
 }
 
 // todo: change responseChan to recipient actor
@@ -209,6 +239,21 @@ func (msgr *messenger) handleJoinAccept(_ actor.MessageType, info actor.Payload)
 		remoteIds = append(remoteIds, remoteId)
 	}
 	cmd.responseChan <- &joinAcceptBody{Topics: topics, Peers: remoteIds}
+}
+
+func (msgr *messenger) handleJoinAccepted(_ actor.MessageType, info actor.Payload) {
+	msg := info.(*joinAcceptReply)
+	msgr.logf("handleJoinAccepted: msg = %+v\n", msg)
+	server := msgr.servers[msg.serverId]
+	msgr.logf("handleJoinAccepted: server = %+v\n", server)
+	if server != nil {
+		for _, topic := range msg.reply.Topics {
+			server.topics[topic] = struct{}{}
+		}
+	}
+	for _, peer := range msg.reply.Peers {
+		msgr.startServer(peer)
+	}
 }
 
 func (msgr *messenger) handleMessage(_ actor.MessageType, info actor.Payload) {
@@ -239,7 +284,7 @@ func (msgr *messenger) runHandler(cmd *messageCommand, msg *actorMessage, handle
 		reply.MessageType = replyPanic
 	}
 
-	cmd.writer.Send("message", reply)
+	cmd.writer.Send("write", reply)
 }
 
 func (msgr *messenger) runHandlerProtected(msg *actorMessage, handler Handler) (result []byte, err error) {
@@ -257,6 +302,11 @@ func (msgr *messenger) runHandlerProtected(msg *actorMessage, handler Handler) (
 
 }
 
+func (msgr *messenger) handleError(_ actor.MessageType, info actor.Payload) {
+	msg := info.(*errorMessage)
+	msgr.logf("received error from %s: %v", msg.name, msg.error)
+}
+
 func (msgr *messenger) handleServerGone(_ actor.MessageType, info actor.Payload) {
 	serverId := info.(hostId)
 	delete(msgr.servers, serverId)
@@ -266,21 +316,6 @@ func (msgr *messenger) handleClientGone(_ actor.MessageType, info actor.Payload)
 	clientId := info.(hostId)
 	delete(msgr.clients, clientId)
 }
-
-// func (msgr *messenger) newClient(_ actor.MessageType, info actor.Payload) {
-// 	// todo
-// 	client := &client{
-// 		hostId: clientId,
-// 		conn:   conn,
-// 	}
-// 	msgr.clients[clientId] = client
-
-// 	go msgr.clientReadLoop(client.hostId)
-
-// 	// todo: create server if doesn't exist yet
-
-// 	Log.Infof("%s has joined.", clientId)
-// }
 
 func (msgr *messenger) getTopics() []topic {
 	topics := make([]topic, 0, len(msgr.subscriptions))
@@ -300,25 +335,17 @@ func (msgr *messenger) Unsubscribe(_topic string) {
 	msgr.broadcastSubscription(unsubscribe, _topic)
 }
 
-func (msgr *messenger) initialDial(serverId hostId) {
-	// todo
-	// peers := msgr.dial(serverId)
-	// for _, peer := range peers {
-	// 	msgr.initialDial(peer)
-	// }
-}
-
 func (msgr *messenger) Leave() {
 	msgr.clientBroadcast(leaving, nil)
 
-	msgr.listener.Send("stop", nil)
+	msgr.listener.Stop()
 
 	for _, server := range msgr.servers {
-		server.Send("stop", nil)
+		server.Stop()
 	}
 
 	for _, client := range msgr.clients {
-		client.Send("stop", nil)
+		client.Stop()
 	}
 
 	// todo: wait for client and servers to be gone
@@ -342,7 +369,7 @@ func (msgr *messenger) Publish(_topic string, body []byte) (MessageId, error) {
 		Topic:       topic(_topic),
 		Body:        body,
 	}
-	to.Send("message", msg)
+	to.Send("publish", msg)
 	return msg.MessageId, nil
 }
 
@@ -360,7 +387,7 @@ func (msgr *messenger) Broadcast(_topic string, body []byte) error {
 	}
 
 	for _, server := range servers {
-		server.Send("message", msg)
+		server.Send("publish", msg)
 	}
 
 	return nil
@@ -375,7 +402,7 @@ func (msgr *messenger) clientBroadcast(msgType messageType, body []byte) {
 	}
 
 	for _, client := range msgr.clients {
-		client.Send("message", msg)
+		client.Send("write", msg)
 	}
 }
 
@@ -507,4 +534,8 @@ func resolveAddr(addr string) (hostId, error) {
 
 func (msgr *messenger) stop() {
 	msgr.Stop()
+}
+
+func (msgr *messenger) logf(format string, params ...interface{}) {
+	log.Printf(">>> %s: "+format, append([]interface{}{string(msgr.hostId) + "-messenger"}, params...)...)
 }

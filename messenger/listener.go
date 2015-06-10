@@ -3,10 +3,12 @@ package messenger
 import (
 	"bytes"
 	"github.com/andrew-suprun/envoy/actor"
+	"log"
 	"net"
 )
 
 type listener struct {
+	name string
 	actor.Actor
 	hostId
 	net.Listener
@@ -14,14 +16,14 @@ type listener struct {
 	stopped bool
 }
 
-func newListener(msgr *messenger, hostId hostId) (actor.Actor, error) {
+func newListener(name string, msgr actor.Actor, hostId hostId) (actor.Actor, error) {
 	lsnr := &listener{
-		Actor:  actor.NewActor("listener"),
+		name:   name,
+		Actor:  actor.NewActor(name),
 		hostId: hostId,
 		msgr:   msgr,
 	}
 	lsnr.
-		RegisterHandler("start", lsnr.handleStart).
 		RegisterHandler("stop", lsnr.handleStop).
 		Start()
 
@@ -32,17 +34,13 @@ func newListener(msgr *messenger, hostId hostId) (actor.Actor, error) {
 		return nil, err
 	}
 	Log.Infof("Listening on: %s", lsnr.hostId)
+	go lsnr.listen()
 	return lsnr, nil
-}
-
-func (lsnr *listener) handleStart(_ actor.MessageType, _ actor.Payload) {
-	lsnr.listen()
 }
 
 func (lsnr *listener) handleStop(_ actor.MessageType, _ actor.Payload) {
 	if !lsnr.stopped {
 		lsnr.stopped = true
-		lsnr.Stop()
 		lsnr.Listener.Close()
 	}
 }
@@ -55,19 +53,23 @@ func (lsnr *listener) listen() {
 			continue
 		}
 
+		lsnr.logf("accepted %s", conn.RemoteAddr())
 		clientId, err := lsnr.readJoinInvite(conn)
+		lsnr.logf("read invite from %s; err = %v", clientId, err)
 		if err != nil {
 			Log.Errorf("Failed to read join invite: err = %v", err)
 			continue
 		}
 
 		err = lsnr.writeJoinAccept(conn)
+		lsnr.logf("sent acceptance to %s; err = %v", clientId, err)
 		if err != nil {
 			Log.Errorf("Failed to write join accept: err = %v", err)
 			continue
 		}
 
-		lsnr.msgr.Send("new-client", newPeerCommand{clientId, conn})
+		lsnr.logf("sent new-client to msgr for client %s", clientId)
+		lsnr.msgr.Send("new-client", &newPeerCommand{clientId, conn})
 	}
 }
 
@@ -89,4 +91,8 @@ func (lsnr *listener) writeJoinAccept(conn net.Conn) error {
 	buf := &bytes.Buffer{}
 	encode(<-responseChan, buf)
 	return writeMessage(conn, &message{MessageId: newId(), MessageType: joinAccept, Body: buf.Bytes()})
+}
+
+func (lsnr *listener) logf(format string, params ...interface{}) {
+	log.Printf(">>> %s: "+format, append([]interface{}{lsnr.name}, params...)...)
 }

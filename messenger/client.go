@@ -7,6 +7,7 @@ import (
 )
 
 type client struct {
+	name string
 	actor.Actor
 	hostId
 	msgr     actor.Actor
@@ -16,25 +17,44 @@ type client struct {
 	stopped  bool
 }
 
-func newClient(clientId hostId, conn net.Conn, msgr actor.Actor) actor.Actor {
+func newClient(name string, clientId hostId, conn net.Conn, msgr actor.Actor) actor.Actor {
 	client := &client{
+		name:   name,
 		hostId: clientId,
-		Actor:  actor.NewActor("client-" + string(clientId)),
+		Actor:  actor.NewActor(name),
 		msgr:   msgr,
 	}
-	client.reader = newReader("client-reader-"+string(clientId), conn, client)
-	client.writer = newWriter("client-writer-"+string(clientId), conn, client)
+	client.reader = newReader(client.name+"-reader", conn, client)
+	client.writer = newWriter(client.name+"-writer", conn, client)
 
 	return client.
-		RegisterHandler("message", client.handleMessage).
+		RegisterHandler("read", client.handleRead).
+		RegisterHandler("write", client.handleWrite).
+		RegisterHandler("error", client.handleError).
 		Start()
 }
 
-func (client *client) handleMessage(msgType actor.MessageType, info actor.Payload) {
+func (client *client) handleRead(msgType actor.MessageType, info actor.Payload) {
 	msg := info.(*actorMessage)
 	if msg.error != nil {
-		// todo: handle read error
+		client.msgr.Send("error", &errorMessage{client.name, msg.error})
+		client.stop()
 	}
 
 	client.msgr.Send("message", &messageCommand{info, client.writer})
+}
+
+func (client *client) handleWrite(msgType actor.MessageType, info actor.Payload) {
+	client.writer.Send("write", info)
+}
+
+func (client *client) handleError(msgType actor.MessageType, info actor.Payload) {
+	msg := info.(error)
+	client.msgr.Send("error", &errorMessage{client.name, msg})
+	client.stop()
+}
+
+func (client *client) stop() {
+	client.writer.Stop()
+	client.reader.Stop()
 }

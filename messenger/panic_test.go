@@ -9,14 +9,20 @@ import (
 func TestPanic(t *testing.T) {
 	log.Println("---------------- TestPanic ----------------")
 
-	server := NewMessenger()
+	server, err := NewMessenger("localhost:50000")
+	if err != nil {
+		t.FailNow()
+	}
 	defer server.Leave()
 	server.Subscribe("job", panicingHandler)
-	server.Join("localhost:50000")
+	server.Join()
 
-	client := NewMessenger()
+	client, err := NewMessenger("localhost:40000")
+	if err != nil {
+		t.FailNow()
+	}
 	defer client.Leave()
-	client.Join("localhost:40000", "localhost:50000")
+	client.Join("localhost:50000")
 
 	reply, _, err := client.Request("job", []byte("Hello"), time.Second)
 	log.Printf("TestPanic: reply = %s; err = %v", string(reply), err)
