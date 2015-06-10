@@ -2,6 +2,7 @@ package messenger
 
 import (
 	"bytes"
+	"fmt"
 	"github.com/andrew-suprun/envoy/actor"
 	"log"
 	"net"
@@ -12,9 +13,9 @@ import (
 type pendingReplies map[messageId]chan *actorMessage
 
 type server struct {
-	name string
-	actor.Actor
 	hostId
+	actor.Actor
+	serverId hostId
 	pendingReplies
 	reader  actor.Actor
 	writer  actor.Actor
@@ -22,11 +23,11 @@ type server struct {
 	stopped bool
 }
 
-func newServer(name string, serverId hostId, msgr actor.Actor) actor.Actor {
+func newServer(hostId, serverId hostId, msgr actor.Actor) actor.Actor {
 	srv := &server{
-		name:           name,
-		hostId:         serverId,
-		Actor:          actor.NewActor(name),
+		hostId:         hostId,
+		serverId:       serverId,
+		Actor:          actor.NewActor(fmt.Sprintf("%s-%s-server", hostId, serverId)),
 		pendingReplies: make(pendingReplies),
 		msgr:           msgr,
 	}
@@ -44,10 +45,10 @@ func (srv *server) handleStart(_ actor.MessageType, _ actor.Payload) {
 	srv.logf("handleStart: entered\n")
 	for !srv.stopped {
 		srv.logf("handleStart: dialing\n")
-		conn, err := net.Dial("tcp", string(srv.hostId))
+		conn, err := net.Dial("tcp", string(srv.serverId))
 		srv.logf("handleStart: dialed: err = %v\n", err)
 		if err != nil {
-			Log.Errorf("Failed to connect to '%s'. Will re-try.", srv.name)
+			Log.Errorf("Failed to connect to '%s'. Will re-try.", srv.serverId)
 			time.Sleep(RedialInterval)
 			continue
 		}
@@ -55,7 +56,7 @@ func (srv *server) handleStart(_ actor.MessageType, _ actor.Payload) {
 		err = writeJoinInvite(srv.hostId, conn)
 		srv.logf("handleStart: sent invite: err = %v\n", err)
 		if err != nil {
-			Log.Errorf("Failed to invite '%s'. Will re-try.", srv.hostId)
+			Log.Errorf("Failed to invite '%s'. Will re-try.", srv.serverId)
 			time.Sleep(RedialInterval)
 			continue
 		}
@@ -68,14 +69,13 @@ func (srv *server) handleStart(_ actor.MessageType, _ actor.Payload) {
 			continue
 		}
 
-		srv.reader = newReader(srv.name+"-reader", conn, srv)
+		srv.reader = newReader(fmt.Sprintf("%s-%s-reader", srv.hostId, srv.serverId), conn, srv)
 		srv.logf("handleStart: started reader\n")
-		srv.writer = newWriter(srv.name+"-writer", conn, srv)
+		srv.writer = newWriter(fmt.Sprintf("%s-%s-writer", srv.hostId, srv.serverId), conn, srv)
 		srv.logf("handleStart: started writer\n")
 
-		srv.logf("sending joinAcceptReply = %+v\n", &joinAcceptReply{srv.hostId, reply})
-		srv.msgr.Send("join-accepted", &joinAcceptReply{srv.hostId, reply})
-		srv.logf("sent joinAcceptReply = %+v\n", &joinAcceptReply{srv.hostId, reply})
+		srv.msgr.Send("join-accepted", &joinAcceptReply{srv.serverId, reply})
+		srv.logf("sent joinAcceptReply = %#v\n", *reply)
 		return
 	}
 }
@@ -145,5 +145,5 @@ func readJoinAccept(conn net.Conn) (*joinAcceptBody, error) {
 }
 
 func (srv *server) logf(format string, params ...interface{}) {
-	log.Printf(">>> %s: "+format, append([]interface{}{srv.name}, params...)...)
+	log.Printf(">>> %s-%s-server: "+format, append([]interface{}{srv.hostId, srv.serverId}, params...)...)
 }

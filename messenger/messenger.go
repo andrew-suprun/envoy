@@ -200,7 +200,7 @@ func (msgr *messenger) Join(remotes ...string) {
 
 func (msgr *messenger) startServer(serverId hostId) {
 	if _, exists := msgr.servers[serverId]; !exists {
-		server := newServer(fmt.Sprintf("%s-%s-server", msgr.hostId, serverId), serverId, msgr)
+		server := newServer(msgr.hostId, serverId, msgr)
 		msgr.servers[serverId] = &serverActor{
 			hostId: serverId,
 			Actor:  server,
