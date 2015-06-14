@@ -6,7 +6,6 @@ import (
 	"github.com/andrew-suprun/envoy/actor"
 	"log"
 	"net"
-	"runtime/debug"
 	"time"
 )
 
@@ -32,98 +31,91 @@ func newServer(hostId, serverId hostId, msgr actor.Actor) actor.Actor {
 		msgr:           msgr,
 	}
 
-	return srv.
+	srv.
 		RegisterHandler("start", srv.handleStart).
 		RegisterHandler("publish", srv.handlePublish).
 		RegisterHandler("request", srv.handleRequest).
-		RegisterHandler("read", srv.handleReply).
-		RegisterHandler("stop", srv.handleStop).
-		Start()
+		RegisterHandler("read", srv.handleRead).
+		RegisterHandler("error", srv.handleError).
+		RegisterHandler("stop", srv.handleStop)
+
+	return srv
 }
 
-func (srv *server) handleStart(_ actor.MessageType, _ actor.Payload) {
-	srv.logf("handleStart: entered\n")
-	for !srv.stopped {
-		srv.logf("handleStart: dialing\n")
-		conn, err := net.Dial("tcp", string(srv.serverId))
-		srv.logf("handleStart: dialed: err = %v\n", err)
-		if err != nil {
-			Log.Errorf("Failed to connect to '%s'. Will re-try.", srv.serverId)
-			time.Sleep(RedialInterval)
-			continue
-		}
-
-		err = writeJoinInvite(srv.hostId, conn)
-		srv.logf("handleStart: sent invite: err = %v\n", err)
-		if err != nil {
-			Log.Errorf("Failed to invite '%s'. Will re-try.", srv.serverId)
-			time.Sleep(RedialInterval)
-			continue
-		}
-
-		reply, err := readJoinAccept(conn)
-		srv.logf("handleStart: read acceptance: err = %v\n", err)
-		if err != nil {
-			Log.Errorf("Failed to read join accept from '%s'. Will re-try.", conn)
-			time.Sleep(RedialInterval)
-			continue
-		}
-
-		srv.reader = newReader(fmt.Sprintf("%s-%s-reader", srv.hostId, srv.serverId), conn, srv)
-		srv.logf("handleStart: started reader\n")
-		srv.writer = newWriter(fmt.Sprintf("%s-%s-writer", srv.hostId, srv.serverId), conn, srv)
-		srv.logf("handleStart: started writer\n")
-
-		srv.msgr.Send("join-accepted", &joinAcceptReply{srv.serverId, reply})
-		srv.logf("sent joinAcceptReply = %#v\n", *reply)
+func (srv *server) handleStart(_ string, _ []interface{}) {
+	conn, err := net.Dial("tcp", string(srv.serverId))
+	if err != nil {
+		Log.Errorf("Failed to connect to '%s'. Will re-try.", srv.serverId)
+		srv.redial()
 		return
 	}
+
+	err = writeJoinInvite(srv.hostId, conn)
+	if err != nil {
+		Log.Errorf("Failed to invite '%s'. Will re-try.", srv.serverId)
+		srv.redial()
+		return
+	}
+
+	reply, err := readJoinAccept(conn)
+	if err != nil {
+		Log.Errorf("Failed to read join accept from '%s'. Will re-try.", conn)
+		srv.redial()
+		return
+	}
+
+	srv.reader = newReader(fmt.Sprintf("%s-%s-server-reader", srv.hostId, srv.serverId), conn, srv)
+	srv.writer = newWriter(fmt.Sprintf("%s-%s-server-writer", srv.hostId, srv.serverId), conn, srv)
+
+	srv.msgr.Send("server-started", srv.serverId, reply)
+	return
 }
 
-func (srv *server) handleStop(_ actor.MessageType, _ actor.Payload) {
-	srv.logf("--- entered handleStop ---")
+func (srv *server) redial() {
+	time.AfterFunc(RedialInterval, func() {
+		srv.Send("start")
+	})
+}
+
+func (srv *server) handleStop(_ string, _ []interface{}) {
+	for _, replyChan := range srv.pendingReplies {
+		replyChan <- &actorMessage{error: ServerDisconnectedError}
+	}
+
 	if srv.reader != nil {
-		srv.reader.Stop()
-		srv.logf("--- stopped reader ---")
+		srv.reader.Send("stop")
 	}
 
 	if srv.writer != nil {
-		srv.writer.Stop()
-		srv.logf("--- stopped writer --- ")
+		srv.writer.Send("stop")
 	}
-	srv.logf("--- exiting handleStop ---")
 }
 
-func (srv *server) handleMessage(_ actor.MessageType, info actor.Payload) {
-	cmd := info.(*actorMessage)
-	srv.logf("received message: %#v; stack:\n%s", cmd.message, debug.Stack())
+func (srv *server) handlePublish(_ string, info []interface{}) {
+	srv.writer.Send("write", info...)
 }
 
-func (srv *server) handlePublish(_ actor.MessageType, info actor.Payload) {
-	srv.writer.Send("write", info)
+func (srv *server) handleRequest(_ string, info []interface{}) {
+	msg := info[0].(*message)
+	replyChan := info[1].(chan *actorMessage)
+	srv.pendingReplies[msg.MessageId] = replyChan
+	srv.writer.Send("write", msg)
 }
 
-func (srv *server) handleRequest(_ actor.MessageType, info actor.Payload) {
-	cmd := info.(*requestCommand)
-	srv.pendingReplies[cmd.MessageId] = cmd.replyChan
-	srv.writer.Send("write", cmd.message)
-}
-
-func (srv *server) handleReply(_ actor.MessageType, info actor.Payload) {
-	msg := info.(*actorMessage)
+func (srv *server) handleRead(_ string, info []interface{}) {
+	msg := info[0].(*message)
 	replyChan := srv.pendingReplies[msg.MessageId]
 	if replyChan == nil {
 		Log.Errorf("Received unexpected reply. Ignoring.")
 	}
-	replyChan <- msg
+	delete(srv.pendingReplies, msg.MessageId)
+	replyChan <- &actorMessage{message: msg}
 }
 
-func (srv *server) stop() {
-	for _, replyChan := range srv.pendingReplies {
-		replyChan <- &actorMessage{error: ServerDisconnectedError}
-	}
-	srv.writer.Stop()
-	srv.reader.Stop()
+func (srv *server) handleError(_ string, info []interface{}) {
+	err := info[0].(error)
+	Log.Errorf("%s-%s-server: Received network error: %v. Will try to re-connect.", srv.hostId, srv.serverId, err)
+	srv.msgr.Send("server-error", srv.serverId, err)
 }
 
 func writeJoinInvite(hostId hostId, conn net.Conn) error {

@@ -2,71 +2,49 @@ package actor
 
 import (
 	"fmt"
+	"log"
 	"sync"
 )
 
 type Actor interface {
-	RegisterHandler(MessageType, Handler) Actor
-	Start() Actor
-	Send(MessageType, Payload) Actor
-	Stop()
+	RegisterHandler(messageType string, handler Handler) Actor
+	Send(messageType string, params ...interface{})
 }
 
-type MessageType string
-
-type Payload interface{}
-
-type Handler func(MessageType, Payload)
+type Handler func(messageType string, params []interface{})
 
 func NewActor(name string) Actor {
 	return &actor{
 		name:     name,
-		handlers: make(map[MessageType]Handler),
+		handlers: make(map[string]Handler),
 		Cond:     sync.NewCond(&sync.Mutex{}),
 	}
 }
 
 type actor struct {
 	name     string
-	handlers map[MessageType]Handler
+	handlers map[string]Handler
 	pending  []message
 	*sync.Cond
-	stopped bool
 }
 
 type message struct {
-	MessageType
-	Payload
+	messageType string
+	params      []interface{}
 }
 
-func (a *actor) RegisterHandler(msgType MessageType, handler Handler) Actor {
+func (a *actor) RegisterHandler(msgType string, handler Handler) Actor {
 	a.handlers[msgType] = handler
 	return a
 }
 
-func (a *actor) Start() Actor {
-	a.logf("started\n")
-	go a.run()
-	return a
-}
-
 func (a *actor) run() {
+	a.logf("started")
 	for {
-		a.logf("entered for loop\n")
 		a.Cond.L.Lock()
 
 		if len(a.pending) == 0 {
 			a.Cond.Wait()
-			a.logf("signaled\n")
-		}
-
-		if a.stopped {
-			a.Cond.L.Unlock()
-			return
-		}
-
-		a.logf("pending = %d\n", len(a.pending))
-		if len(a.pending) == 0 {
 			a.Cond.L.Unlock()
 			continue
 		}
@@ -76,43 +54,29 @@ func (a *actor) run() {
 
 		a.Cond.L.Unlock()
 
-		a.logf("msg = %#v\n", msg)
-
-		h, found := a.handlers[msg.MessageType]
+		h, found := a.handlers[msg.messageType]
 		if !found {
-			panic(fmt.Sprintf("Actor %s received unsupported message type: %s", a.name, msg.MessageType))
+			panic(fmt.Sprintf("Actor %s received unsupported message type: %s", a.name, msg.messageType))
 		}
-		a.logf("found handler for %v\n", msg.MessageType)
-		h(msg.MessageType, msg.Payload)
-		a.logf("%s handled\n", msg.MessageType)
+		a.logf("got '%s'", msg.messageType)
+		h(msg.messageType, msg.params)
+		if msg.messageType == "stop" {
+			a.logf("stopped\n")
+			return
+		}
 	}
 }
 
-func (a *actor) Send(msgType MessageType, info Payload) Actor {
-	a.logf("sending %s: %#v\n", msgType, info)
+func (a *actor) Send(msgType string, info ...interface{}) {
 	a.Cond.L.Lock()
+	if a.pending == nil {
+		go a.run()
+	}
 	a.pending = append(a.pending, message{msgType, info})
 	a.Cond.Signal()
 	a.Cond.L.Unlock()
-	return a
-}
-
-func (a *actor) Stop() {
-	var stopHandler Handler
-	var found bool
-	a.Cond.L.Lock()
-	if a.stopped {
-		a.Cond.L.Unlock()
-		return
-	}
-	stopHandler, found = a.handlers["stop"]
-	a.stopped = true
-	a.Cond.L.Unlock()
-	if found {
-		stopHandler("stop", nil)
-	}
 }
 
 func (a *actor) logf(format string, params ...interface{}) {
-	// log.Printf(">>> %s: Actor: "+format, append([]interface{}{a.name}, params...)...)
+	log.Printf(">>> %s: Actor: "+format, append([]interface{}{a.name}, params...)...)
 }

@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -75,12 +76,17 @@ func TestTwoOnTwo(t *testing.T) {
 	defer client2.Leave()
 	client2.Join("localhost:50000")
 
-	c := 0
+	// TODO: remove sleep
+	time.Sleep(time.Second)
+
+	var c int64 = 0
+	var cc int64
 	readMessage = func(conn net.Conn) (*message, error) {
-		c++
-		if c%10 == 0 {
-			log.Printf("--- closing connection %s:%s ---", conn.RemoteAddr(), conn.LocalAddr())
+		if cc%20 == 0 {
+			cc = atomic.AddInt64(&c, 1)
+			log.Printf("### closing connection %s:%s [%d] ---", conn.RemoteAddr(), conn.LocalAddr(), cc)
 			conn.Close()
+			cc = atomic.AddInt64(&c, 1)
 		}
 		return _readMessage(conn)
 	}
@@ -90,9 +96,11 @@ func TestTwoOnTwo(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		for i := 0; i < 100; i++ {
+			cc = atomic.AddInt64(&c, 1)
+			log.Printf("client.1: sending 'Hello1'; cc = %d", cc)
 			reply, _, err := client1.Request("job", []byte("Hello1"), time.Second)
 			rep := string(reply)
-			log.Println(rep)
+			log.Printf("client.1: received reply '%s'; err = %v", rep, err)
 			if err != nil {
 				t.Errorf("Request returned error: %s", err)
 				break
@@ -112,9 +120,11 @@ func TestTwoOnTwo(t *testing.T) {
 
 	go func() {
 		for i := 0; i < 100; i++ {
+			cc = atomic.AddInt64(&c, 1)
+			log.Printf("client.2: sending 'Hello2'; cc = %d", cc)
 			reply, _, err := client2.Request("job", []byte("Hello2"), time.Second)
 			rep := string(reply)
-			log.Println(rep)
+			log.Printf("client.2: received reply '%s'; err = %v", rep, err)
 			if err != nil {
 				t.Errorf("Request returned error: %s", err)
 				break

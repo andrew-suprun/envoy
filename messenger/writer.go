@@ -10,7 +10,6 @@ type writer struct {
 	actor.Actor
 	net.Conn
 	recipient actor.Actor
-	stopped   bool
 }
 
 func newWriter(name string, conn net.Conn, recipient actor.Actor) actor.Actor {
@@ -23,13 +22,20 @@ func newWriter(name string, conn net.Conn, recipient actor.Actor) actor.Actor {
 
 	return writer.
 		RegisterHandler("write", writer.handleWrite).
-		Start()
+		RegisterHandler("stop", writer.handleStop)
 }
 
-func (writer *writer) handleWrite(_ actor.MessageType, info actor.Payload) {
-	err := writeMessage(writer.Conn, info.(*message))
+func (writer *writer) handleWrite(_ string, info []interface{}) {
+	err := writeMessage(writer.Conn, info[0].(*message))
 	if err != nil {
-		writer.recipient.Send("error", &errorMessage{writer.name, err})
-		writer.Stop()
+		writer.recipient.Send("error", err)
 	}
+}
+
+func (writer *writer) handleStop(_ string, _ []interface{}) {
+	writer.Close()
+}
+
+func (writer *writer) logf(format string, params ...interface{}) {
+	Log.Debugf(">>> %s: "+format, append([]interface{}{writer.name}, params...)...)
 }

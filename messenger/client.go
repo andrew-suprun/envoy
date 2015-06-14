@@ -1,6 +1,7 @@
 package messenger
 
 import (
+	"fmt"
 	"github.com/andrew-suprun/envoy/actor"
 	"net"
 	"sync"
@@ -9,20 +10,23 @@ import (
 type client struct {
 	name string
 	actor.Actor
-	hostId
+	clientId hostId
 	msgr     actor.Actor
 	reader   actor.Actor
 	writer   actor.Actor
 	inflight sync.WaitGroup
-	stopped  bool
+}
+
+func (h *client) String() string {
+	return fmt.Sprintf("[client %s]", h.name)
 }
 
 func newClient(name string, clientId hostId, conn net.Conn, msgr actor.Actor) actor.Actor {
 	client := &client{
-		name:   name,
-		hostId: clientId,
-		Actor:  actor.NewActor(name),
-		msgr:   msgr,
+		name:     name,
+		clientId: clientId,
+		Actor:    actor.NewActor(name),
+		msgr:     msgr,
 	}
 	client.reader = newReader(client.name+"-reader", conn, client)
 	client.writer = newWriter(client.name+"-writer", conn, client)
@@ -31,30 +35,25 @@ func newClient(name string, clientId hostId, conn net.Conn, msgr actor.Actor) ac
 		RegisterHandler("read", client.handleRead).
 		RegisterHandler("write", client.handleWrite).
 		RegisterHandler("error", client.handleError).
-		Start()
+		RegisterHandler("stop", client.handleStop)
 }
 
-func (client *client) handleRead(msgType actor.MessageType, info actor.Payload) {
-	msg := info.(*actorMessage)
-	if msg.error != nil {
-		client.msgr.Send("error", &errorMessage{client.name, msg.error})
-		client.stop()
-	}
-
-	client.msgr.Send("message", &messageCommand{info, client.writer})
+func (client *client) handleRead(msgType string, info []interface{}) {
+	msg := info[0].(*message)
+	client.msgr.Send("message", client.writer, msg)
 }
 
-func (client *client) handleWrite(msgType actor.MessageType, info actor.Payload) {
-	client.writer.Send("write", info)
+func (client *client) handleError(msgType string, info []interface{}) {
+	err := info[0].(error)
+	Log.Errorf("%s: Received network error: %v. Will try to re-connect.", client.name, err)
+	client.msgr.Send("client-error", client.clientId, err)
 }
 
-func (client *client) handleError(msgType actor.MessageType, info actor.Payload) {
-	msg := info.(error)
-	client.msgr.Send("error", &errorMessage{client.name, msg})
-	client.stop()
+func (client *client) handleWrite(msgType string, info []interface{}) {
+	client.writer.Send("write", info...)
 }
 
-func (client *client) stop() {
-	client.writer.Stop()
-	client.reader.Stop()
+func (client *client) handleStop(msgType string, _ []interface{}) {
+	client.writer.Send("stop")
+	client.reader.Send("stop")
 }
