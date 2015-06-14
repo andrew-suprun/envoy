@@ -9,6 +9,7 @@ import (
 
 var readMessage func(net.Conn) (*message, error) = _readMessage
 
+// todo: add timeout handling
 func _readMessage(from net.Conn) (*message, error) {
 	if from == nil {
 		return nil, NilConnError
@@ -42,6 +43,7 @@ func _readMessage(from net.Conn) (*message, error) {
 
 var writeMessage func(net.Conn, *message) error = _writeMessage
 
+// todo: add timeout handling
 func _writeMessage(to net.Conn, msg *message) error {
 	buf := bytes.NewBuffer(make([]byte, 4, 128))
 	encode(msg, buf)

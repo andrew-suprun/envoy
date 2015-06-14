@@ -7,14 +7,16 @@ import (
 
 type reader struct {
 	name string
+	hostId
 	actor.Actor
 	net.Conn
 	recipient actor.Actor
 }
 
-func newReader(name string, conn net.Conn, recipient actor.Actor) actor.Actor {
+func newReader(name string, hostId hostId, conn net.Conn, recipient actor.Actor) actor.Actor {
 	reader := &reader{
 		name:      name,
+		hostId:    hostId,
 		Actor:     actor.NewActor(name),
 		Conn:      conn,
 		recipient: recipient,
@@ -30,7 +32,7 @@ func newReader(name string, conn net.Conn, recipient actor.Actor) actor.Actor {
 func (reader *reader) handleReadMessage(_ string, _ []interface{}) {
 	msg, err := readMessage(reader.Conn)
 	if err != nil {
-		reader.recipient.Send("error", err)
+		reader.recipient.Send("network-error", reader.hostId, err)
 	} else {
 		reader.recipient.Send("read", msg)
 		reader.Send("read-message")

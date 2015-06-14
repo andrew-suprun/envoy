@@ -7,10 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"github.com/andrew-suprun/envoy/actor"
-	"log"
 	mRand "math/rand"
 	"net"
 	"runtime/debug"
+	"sync"
 	"time"
 )
 
@@ -52,8 +52,7 @@ const (
 	request
 	reply
 	replyPanic
-	joinInvite
-	joinAccept
+	join
 	leaving
 	subscribe
 	unsubscribe
@@ -74,15 +73,19 @@ type messenger struct {
 	actor.Actor
 	hostId
 	subscriptions map[topic]Handler
-	servers       map[hostId]*serverActor
-	clients       map[hostId]actor.Actor
+	peers         map[hostId]*peer
 	listener      actor.Actor
+	dialer        actor.Actor
 }
 
-type serverActor struct {
-	hostId
-	actor.Actor
-	topics map[topic]struct{}
+type peer struct {
+	peerId         hostId
+	conn           net.Conn
+	topics         map[topic]struct{}
+	pendingReplies map[messageId]chan *actorMessage
+	inflight       sync.WaitGroup
+	reader         actor.Actor
+	writer         actor.Actor
 }
 
 type message struct {
@@ -102,7 +105,8 @@ type clientMessage struct {
 	*message
 }
 
-type joinAcceptBody struct {
+type joinMessage struct {
+	HostId hostId   `codec:"h,omitempty"`
 	Topics []topic  `codec:"t,omitempty"`
 	Peers  []hostId `codec:"p,omitempty"`
 }
@@ -121,104 +125,106 @@ func NewMessenger(local string) (Messenger, error) {
 	msgr := &messenger{
 		hostId:        hostId(localAddr),
 		subscriptions: make(map[topic]Handler),
-		clients:       make(map[hostId]actor.Actor),
-		servers:       make(map[hostId]*serverActor),
+		peers:         make(map[hostId]*peer),
 	}
 
-	msgr.listener, err = newListener(string(msgr.hostId)+"-listener", msgr, localAddr)
+	msgr.Actor = actor.NewActor(string(msgr.hostId)+"-messenger").
+		RegisterHandler("join", msgr.handleJoin).
+		RegisterHandler("connected", msgr.handleConnected).
+		RegisterHandler("network-error", msgr.handleNetworkError).
+		RegisterHandler("subscribe", msgr.handleSubscribe).
+		RegisterHandler("unsubscribe", msgr.handleUnsubscribe).
+		RegisterHandler("publish", msgr.handlePublish).
+		RegisterHandler("request", msgr.handleRequest).
+		// RegisterHandler("new-client", msgr.handleNewClient).
+		// RegisterHandler("join-accept", msgr.handleJoinAccept).
+		// RegisterHandler("server-started", msgr.handleServerStarted).
+		// RegisterHandler("message", msgr.handleMessage).
+		// RegisterHandler("client-error", msgr.handleClientError).
+		// RegisterHandler("server-error", msgr.handleServerError).
+		RegisterHandler("leave", msgr.handleLeave)
+
+	msgr.listener, err = newListener(string(msgr.hostId)+"-listener", msgr, msgr.newJoinMessage())
 	if err != nil {
 		msgr.Leave()
 		return nil, err
 	}
 
+	msgr.dialer = newDialer(string(msgr.hostId)+"-dialer", msgr)
+
 	return msgr, nil
 }
 
 func (msgr *messenger) Join(remotes ...string) {
-	var remoteAddrs []hostId
+	remoteAddrs := map[hostId]struct{}{}
 	for _, remote := range remotes {
 		remoteAddr, err := resolveAddr(remote)
 		if err == nil {
-			remoteAddrs = append(remoteAddrs, remoteAddr)
+			remoteAddrs[remoteAddr] = struct{}{}
 		} else {
 			Log.Errorf("Cannot resolve address %s. Ignoring.", remote)
 		}
 	}
 
-	msgr.Actor = actor.NewActor(string(msgr.hostId)+"-messenger").
-		RegisterHandler("new-client", msgr.handleNewClient).
-		RegisterHandler("join-accept", msgr.handleJoinAccept).
-		RegisterHandler("server-started", msgr.handleServerStarted).
-		RegisterHandler("request", msgr.handleRequest).
-		RegisterHandler("message", msgr.handleMessage).
-		RegisterHandler("client-error", msgr.handleClientError).
-		RegisterHandler("server-error", msgr.handleServerError).
-		RegisterHandler("leave", msgr.handleLeave)
+	joinWg := &sync.WaitGroup{}
+	joinWg.Add(len(remoteAddrs))
+	msgr.Send("join", remoteAddrs, joinWg)
+	joinWg.Wait()
+}
 
-	for _, remote := range remoteAddrs {
-		msgr.startServer(remote)
+func (msgr *messenger) handleJoin(_ string, info []interface{}) {
+	remoteAddrs := info[0].([]hostId)
+	joinWg := info[1].(*sync.WaitGroup)
+
+	for remote := range remoteAddrs {
+		msgr.dialer.Send("dial", remote, msgr.newJoinMessage(), joinWg)
 	}
 }
 
-func (msgr *messenger) startServer(serverId hostId) {
-	if msgr.hostId == serverId {
-		return
-	}
-	if _, exists := msgr.servers[serverId]; exists {
-		return
-	}
-	server := newServer(msgr.hostId, serverId, msgr)
-	msgr.servers[serverId] = &serverActor{
-		hostId: serverId,
-		Actor:  server,
-		topics: make(map[topic]struct{}),
-	}
-	server.Send("start")
-}
-
-func (msgr *messenger) handleServerStarted(_ string, info []interface{}) {
-	serverId := info[0].(hostId)
-	reply := info[1].(*joinAcceptBody)
-	server := msgr.servers[serverId]
-	if server != nil {
-		for _, topic := range reply.Topics {
-			server.topics[topic] = struct{}{}
-		}
-		Log.Infof("### %s connected to %s: topics: %v; peers: %v", msgr.hostId, serverId, server.topics, reply.Peers)
-	}
-	for _, peerId := range reply.Peers {
-		msgr.startServer(peerId)
-	}
-}
-
-func (msgr *messenger) handleNewClient(_ string, info []interface{}) {
-	clientId := info[0].(hostId)
+func (msgr *messenger) handleConnected(_ string, info []interface{}) {
+	addr := info[0].(hostId)
 	conn := info[1].(net.Conn)
-
-	if _, exists := msgr.clients[clientId]; !exists {
-		client := newClient(fmt.Sprintf("%s-%s-client", msgr.hostId, clientId), clientId, conn, msgr)
-		msgr.clients[clientId] = client
+	reply := info[2].(*joinMessage)
+	var wg *sync.WaitGroup
+	if len(info) >= 4 {
+		wg = info[3].(*sync.WaitGroup)
 	}
-	msgr.startServer(clientId)
+
+	_newPeer := newPeer(addr, conn, reply.Topics)
+	if oldPeer, exists := msgr.peers[addr]; exists {
+		if msgr.hostId < addr {
+			delete(msgr.peers, addr)
+			msgr.shutdown(oldPeer)
+		} else {
+			msgr.shutdown(_newPeer)
+			return
+		}
+	}
+	msgr.peers[addr] = _newPeer
+
+	for _, peerId := range reply.Peers {
+		if _, found := msgr.peers[peerId]; !found {
+			if wg != nil {
+				wg.Add(1)
+			}
+			msgr.dialer.Send("dial", peerId, wg)
+		}
+	}
 }
 
-// todo: ??? change responseChan to recipient actor
-func (msgr *messenger) handleJoinAccept(_ string, info []interface{}) {
-	responseChan := info[0].(chan *joinAcceptBody)
-	var topics []topic = msgr.getTopics()
+func (msgr *messenger) shutdown(peer *peer) {
+	// todo: graceful shutdown
+	peer.conn.Close()
+}
 
-	var hostIds = map[hostId]struct{}{}
-	for clientId := range msgr.clients {
-		hostIds[clientId] = struct{}{}
+func newPeer(hostId hostId, conn net.Conn, topics []topic) *peer {
+	peer := &peer{
+		peerId:         hostId,
+		conn:           conn,
+		topics:         make(map[topic]struct{}),
+		pendingReplies: make(map[messageId]chan *actorMessage),
 	}
-	for serverId := range msgr.servers {
-		hostIds[serverId] = struct{}{}
-	}
-	remoteIds := make([]hostId, 0, len(hostIds))
-	for remoteId := range hostIds {
-		remoteIds = append(remoteIds, remoteId)
-	}
-	responseChan <- &joinAcceptBody{Topics: topics, Peers: remoteIds}
+	return peer
 }
 
 func (msgr *messenger) handleMessage(_ string, info []interface{}) {
@@ -268,26 +274,16 @@ func (msgr *messenger) runHandlerProtected(msg *message, handler Handler) (resul
 
 }
 
-func (msgr *messenger) handleClientError(_ string, info []interface{}) {
-	clientId := info[0].(hostId)
-	// err := info[1].(error)
-	client := msgr.clients[clientId]
-	if client != nil {
-		delete(msgr.clients, clientId)
-		client.Send("stop")
+func (msgr *messenger) handleNetworkError(_ string, info []interface{}) {
+	peerId := info[0].(hostId)
+	err := info[1].(error)
+	Log.Errorf("%s: network error on %s: %v", peerId, err)
+	peer := msgr.peers[peerId]
+	if peer != nil {
+		delete(msgr.peers, peerId)
+		// todo: fugure out async shutdown
+		msgr.shutdown(peer)
 	}
-}
-
-func (msgr *messenger) handleServerError(_ string, info []interface{}) {
-	serverId := info[0].(hostId)
-	// err := info[1].(error)
-	server := msgr.servers[serverId]
-	if server != nil {
-		delete(msgr.servers, serverId)
-		server.Send("stop")
-	}
-
-	msgr.startServer(serverId)
 }
 
 func (msgr *messenger) getTopics() []topic {
@@ -298,14 +294,48 @@ func (msgr *messenger) getTopics() []topic {
 	return topics
 }
 
-func (msgr *messenger) Subscribe(_topic string, handler Handler) {
-	msgr.subscriptions[topic(_topic)] = handler
-	msgr.broadcastSubscription(subscribe, _topic)
+func (msgr *messenger) Subscribe(t string, handler Handler) {
+	msgr.Send("subscribe", topic(t), handler)
 }
 
-func (msgr *messenger) Unsubscribe(_topic string) {
-	delete(msgr.subscriptions, topic(_topic))
-	msgr.broadcastSubscription(unsubscribe, _topic)
+func (msgr *messenger) handleSubscribe(_ string, info []interface{}) {
+	topic := info[0].(topic)
+	handler := info[0].(Handler)
+	msgr.subscriptions[topic] = handler
+	msgr.broadcastSubscription(subscribe, topic)
+}
+
+func (msgr *messenger) Unsubscribe(t string) {
+	msgr.Send("unsubscribe", topic(t))
+}
+
+func (msgr *messenger) handleUnsubscribe(_ string, info []interface{}) {
+	topic := info[0].(topic)
+	delete(msgr.subscriptions, topic)
+	msgr.broadcastSubscription(unsubscribe, topic)
+}
+
+func (msgr *messenger) broadcastSubscription(msgType messageType, t topic) {
+	buf := &bytes.Buffer{}
+	encode(t, buf)
+	msgr.clientBroadcast(msgType, buf.Bytes())
+}
+
+func (msgr *messenger) clientBroadcast(msgType messageType, body []byte) {
+	if len(msgr.peers) == 0 {
+		return
+	}
+
+	msg := &message{
+		MessageId:   newId(),
+		MessageType: msgType,
+		Topic:       "",
+		Body:        body,
+	}
+
+	for _, to := range msgr.peers {
+		to.writer.Send("write", msg)
+	}
 }
 
 func (msgr *messenger) Leave() {
@@ -313,41 +343,52 @@ func (msgr *messenger) Leave() {
 }
 
 func (msgr *messenger) handleLeave(_ string, _ []interface{}) {
-	msgr.clientBroadcast(leaving, nil)
-
 	msgr.listener.Send("stop")
+	peers := msgr.peers
+	msgr.peers = make(map[hostId]*peer)
 
-	for _, server := range msgr.servers {
-		server.Send("stop")
+	for _, peer := range peers {
+		msgr.shutdown(peer)
 	}
-
-	for _, client := range msgr.clients {
-		client.Send("stop")
-	}
-
-	// todo: wait for client and servers to be gone
 }
 
-func (msgr *messenger) broadcastSubscription(msgType messageType, topic string) {
-	buf := &bytes.Buffer{}
-	encode(topic, buf)
-	msgr.clientBroadcast(msgType, buf.Bytes())
-}
-
-func (msgr *messenger) Publish(_topic string, body []byte) (MessageId, error) {
-	to := msgr.selectTopicServer(topic(_topic))
-	if to == nil {
-		return newId(), NoSubscribersError
-	}
-
+func (msgr *messenger) Publish(t string, body []byte) (MessageId, error) {
 	msg := &message{
 		MessageId:   newId(),
 		MessageType: publish,
-		Topic:       topic(_topic),
+		Topic:       topic(t),
 		Body:        body,
 	}
-	to.Send("publish", msg)
-	return msg.MessageId, nil
+	replyChan := make(chan *actorMessage)
+	msgr.Send("publish", msg, replyChan)
+	reply <- replyChan
+	return reply.message, msg.MessageId, reply.error
+}
+
+func (msgr *messenger) handlePublish(_ string, info []interface{}) {
+	timeoutChan := time.After(timeout)
+	msg := info[0].(*message)
+	replyChan := info[1].(chan *actorMessage)
+
+	for {
+		server := msgr.selectTopicServer(topic(_topic))
+		if server == nil {
+			replyChan <- &actorMessage{error: NoSubscribersError}
+			return
+		}
+		server.writer.Send("write", msg)
+		select {
+		case <-timeoutChan:
+			replyChan <- &actorMessage{error: TimeoutError}
+			return
+		case reply := <-replyChan:
+			if reply.error == ServerDisconnectedError {
+				delete(msgr.servers, server.hostId)
+				continue
+			}
+			return reply.message.Body, msg.MessageId, reply.error
+		}
+	}
 }
 
 func (msgr *messenger) Broadcast(_topic string, body []byte) error {
@@ -370,19 +411,6 @@ func (msgr *messenger) Broadcast(_topic string, body []byte) error {
 	return nil
 }
 
-func (msgr *messenger) clientBroadcast(msgType messageType, body []byte) {
-	msg := &message{
-		MessageId:   newId(),
-		MessageType: msgType,
-		Topic:       "",
-		Body:        body,
-	}
-
-	for _, client := range msgr.clients {
-		client.Send("write", msg)
-	}
-}
-
 func (msgr *messenger) Request(_topic string, body []byte, timeout time.Duration) ([]byte, MessageId, error) {
 	msg := &message{
 		MessageId:   newId(),
@@ -394,7 +422,6 @@ func (msgr *messenger) Request(_topic string, body []byte, timeout time.Duration
 	msgr.Send("request", msg, replyChan)
 	reply <- replyChan
 	return reply.message, msg.MessageId, reply.error
-
 }
 
 func (msgr *messenger) handleRequest(_ string, info []interface{}) {
@@ -422,7 +449,7 @@ func (msgr *messenger) handleRequest(_ string, info []interface{}) {
 	}
 }
 
-func (msgr *messenger) selectTopicServer(t topic) *serverActor {
+func (msgr *messenger) selectTopicServer(t topic) *peer {
 	servers := msgr.getServersByTopic(t)
 	if len(servers) == 0 {
 		return nil
@@ -514,6 +541,18 @@ func resolveAddr(addr string) (hostId, error) {
 	return hostId(resolved.String()), nil
 }
 
+func (msgr *messenger) newJoinMessage() *joinMessage {
+	joinMsg := joinMessage{hostId: msgr.hostId}
+	for t := range msgr.subscriptions {
+		joinMessage.Topics = append(joinMessage.Topics, t)
+	}
+	for p := range msgr.peers {
+		joinMessage.Peers = append(joinMessage.Peers, p)
+	}
+
+	return joinMessage
+}
+
 func (msgr *messenger) logf(format string, params ...interface{}) {
-	log.Printf(">>> %s: "+format, append([]interface{}{string(msgr.hostId) + "-messenger"}, params...)...)
+	Log.Debugf(">>> %s: "+format, append([]interface{}{string(msgr.hostId) + "-messenger"}, params...)...)
 }

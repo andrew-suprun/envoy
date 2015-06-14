@@ -10,31 +10,36 @@ import (
 type listener struct {
 	name string
 	actor.Actor
-	hostId
 	net.Listener
-	msgr actor.Actor
+	joinMsg *joinMessage
+	msgr    actor.Actor
 }
 
-func newListener(name string, msgr actor.Actor, hostId hostId) (actor.Actor, error) {
+func newListener(name string, msgr actor.Actor, joinMsg *joinMessage) (actor.Actor, error) {
 	lsnr := &listener{
-		name:   name,
-		Actor:  actor.NewActor(name),
-		hostId: hostId,
-		msgr:   msgr,
+		name:    name,
+		Actor:   actor.NewActor(name),
+		joinMsg: joinMsg,
+		msgr:    msgr,
 	}
 	lsnr.
+		RegisterHandler("set-join-message", lsnr.handleSetJoinMessage).
 		RegisterHandler("accept", lsnr.handleAccept).
 		RegisterHandler("stop", lsnr.handleStop)
 
 	var err error
-	lsnr.Listener, err = net.Listen("tcp", string(hostId))
+	lsnr.Listener, err = net.Listen("tcp", string(lsnr.joinMsg.HostId))
 	if err != nil {
-		Log.Errorf("Failed to listen on %s. Exiting.", hostId)
+		Log.Errorf("Failed to listen on %s. Exiting.", lsnr.joinMsg.HostId)
 		return nil, err
 	}
-	Log.Infof("Listening on: %s", lsnr.hostId)
+	Log.Infof("Listening on: %s", lsnr.joinMsg.HostId)
 	lsnr.Send("accept")
 	return lsnr, nil
+}
+
+func (lsnr *listener) handleSetJoinMessage(_ string, info []interface{}) {
+	lsnr.joinMsg = info[0].(*joinMessage)
 }
 
 func (lsnr *listener) handleStop(_ string, _ []interface{}) {
@@ -50,7 +55,7 @@ func (lsnr *listener) handleAccept(_ string, _ []interface{}) {
 		return
 	}
 
-	clientId, err := lsnr.readJoinInvite(conn)
+	joinMsg, err := lsnr.readJoinInvite(conn)
 	if err != nil {
 		Log.Errorf("Failed to read join invite: err = %v", err)
 		return
@@ -62,27 +67,27 @@ func (lsnr *listener) handleAccept(_ string, _ []interface{}) {
 		return
 	}
 
-	lsnr.msgr.Send("new-client", clientId, conn)
+	lsnr.msgr.Send("connected", hostId(conn.RemoteAddr().String()), conn, joinMsg)
 }
 
-func (lsnr *listener) readJoinInvite(conn net.Conn) (hostId, error) {
-	joinMsg, err := readMessage(conn)
+func (lsnr *listener) readJoinInvite(conn net.Conn) (*joinMessage, error) {
+	msg, err := readMessage(conn)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	buf := bytes.NewBuffer(joinMsg.Body)
-	var reply hostId
-	decode(buf, &reply)
+	buf := bytes.NewBuffer(msg.Body)
+	var reply *joinMessage
+	decode(buf, reply)
 	return reply, nil
 }
 
 func (lsnr *listener) writeJoinAccept(conn net.Conn) error {
-	responseChan := make(chan *joinAcceptBody)
+	responseChan := make(chan *joinMessage)
 	lsnr.msgr.Send("join-accept", responseChan)
 	buf := &bytes.Buffer{}
 	encode(<-responseChan, buf)
-	return writeMessage(conn, &message{MessageId: newId(), MessageType: joinAccept, Body: buf.Bytes()})
+	return writeMessage(conn, &message{MessageId: newId(), MessageType: join, Body: buf.Bytes()})
 }
 
 func (lsnr *listener) logf(format string, params ...interface{}) {

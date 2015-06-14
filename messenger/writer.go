@@ -7,14 +7,16 @@ import (
 
 type writer struct {
 	name string
+	hostId
 	actor.Actor
 	net.Conn
 	recipient actor.Actor
 }
 
-func newWriter(name string, conn net.Conn, recipient actor.Actor) actor.Actor {
+func newWriter(name string, hostId hostId, conn net.Conn, recipient actor.Actor) actor.Actor {
 	writer := &writer{
 		name:      name,
+		hostId:    hostId,
 		Actor:     actor.NewActor(name),
 		Conn:      conn,
 		recipient: recipient,
@@ -28,7 +30,7 @@ func newWriter(name string, conn net.Conn, recipient actor.Actor) actor.Actor {
 func (writer *writer) handleWrite(_ string, info []interface{}) {
 	err := writeMessage(writer.Conn, info[0].(*message))
 	if err != nil {
-		writer.recipient.Send("error", err)
+		writer.recipient.Send("network-error", writer.hostId, err)
 	}
 }
 
