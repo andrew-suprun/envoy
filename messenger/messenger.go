@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/andrew-suprun/envoy/actor"
+	"github.com/andrew-suprun/envoy/future"
 	mRand "math/rand"
 	"net"
 	"runtime/debug"
@@ -166,18 +167,17 @@ func (msgr *messenger) Join(remotes ...string) {
 		}
 	}
 
-	joinWg := &sync.WaitGroup{}
-	joinWg.Add(len(remoteAddrs))
-	msgr.Send("join", remoteAddrs, joinWg)
-	joinWg.Wait()
+	result := future.NewFuture()
+	msgr.Send("join", remoteAddrs, result)
+	result.Value()
 }
 
 func (msgr *messenger) handleJoin(_ string, info []interface{}) {
 	remoteAddrs := info[0].([]hostId)
-	joinWg := info[1].(*sync.WaitGroup)
+	result := info[1].(*future.Future)
 
 	for remote := range remoteAddrs {
-		msgr.dialer.Send("dial", remote, msgr.newJoinMessage(), joinWg)
+		msgr.dialer.Send("dial", remote, msgr.newJoinMessage(), result)
 	}
 }
 
@@ -185,9 +185,9 @@ func (msgr *messenger) handleConnected(_ string, info []interface{}) {
 	addr := info[0].(hostId)
 	conn := info[1].(net.Conn)
 	reply := info[2].(*joinMessage)
-	var wg *sync.WaitGroup
+	var result future.Future
 	if len(info) >= 4 {
-		wg = info[3].(*sync.WaitGroup)
+		result = info[3].(future.Future)
 	}
 
 	_newPeer := newPeer(addr, conn, reply.Topics)
@@ -202,13 +202,16 @@ func (msgr *messenger) handleConnected(_ string, info []interface{}) {
 	}
 	msgr.peers[addr] = _newPeer
 
+	newPeers := false
 	for _, peerId := range reply.Peers {
 		if _, found := msgr.peers[peerId]; !found {
-			if wg != nil {
-				wg.Add(1)
-			}
-			msgr.dialer.Send("dial", peerId, wg)
+			newPeers = true
+			msgr.dialer.Send("dial", peerId, result)
 		}
+	}
+
+	if result != nil && !newPeers {
+		result.SetValue(true)
 	}
 }
 

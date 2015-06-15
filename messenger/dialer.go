@@ -3,8 +3,8 @@ package messenger
 import (
 	"bytes"
 	"github.com/andrew-suprun/envoy/actor"
+	"github.com/andrew-suprun/envoy/future"
 	"net"
-	"sync"
 	"time"
 )
 
@@ -25,13 +25,13 @@ func newDialer(name string, msgr actor.Actor) actor.Actor {
 func (dialer *dialer) handleDial(_ string, info []interface{}) {
 	addr := info[0].(hostId)
 	joinMsg := info[1].(*message)
-	var wg *sync.WaitGroup
+	var result future.Future
 	if len(info) >= 2 {
-		wg = info[1].(*sync.WaitGroup)
+		result = info[1].(future.Future)
 	}
 
-	if wg != nil {
-		defer wg.Done()
+	if result != nil {
+		defer result.SetValue(true)
 	}
 
 	conn, err := net.Dial("tcp", string(addr))
