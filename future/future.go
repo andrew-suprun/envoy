@@ -1,6 +1,7 @@
 package future
 
 import (
+	"fmt"
 	"sync"
 )
 
@@ -53,6 +54,7 @@ func (f *future) SetValue(value interface{}) {
 	if !f.set {
 		f.value = value
 		f.set = true
+		f.cond.Broadcast()
 	}
 	f.cond.L.Unlock()
 }
@@ -62,6 +64,19 @@ func (f *future) SetError(err error) {
 	if !f.set {
 		f.err = err
 		f.set = true
+		f.cond.Broadcast()
 	}
 	f.cond.L.Unlock()
+}
+
+func (f *future) String() string {
+	f.cond.L.Lock()
+	defer f.cond.L.Unlock()
+	if !f.set {
+		return "[feature: pending]"
+	} else if f.err != nil {
+		return fmt.Sprintf("[feature: error=%+v]", f.err)
+	} else {
+		return fmt.Sprintf("[feature: value=%+v]", f.value)
+	}
 }

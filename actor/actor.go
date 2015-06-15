@@ -2,7 +2,6 @@ package actor
 
 import (
 	"fmt"
-	"log"
 	"sync"
 )
 
@@ -78,5 +77,5 @@ func (a *actor) Send(msgType string, info ...interface{}) {
 }
 
 func (a *actor) logf(format string, params ...interface{}) {
-	log.Printf(">>> %s: Actor: "+format, append([]interface{}{a.name}, params...)...)
+	// log.Printf(">>> %s: Actor: "+format, append([]interface{}{a.name}, params...)...)
 }

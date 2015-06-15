@@ -3,7 +3,6 @@ package messenger
 import (
 	"log"
 	"testing"
-	"time"
 )
 
 func TestPanic(t *testing.T) {
@@ -24,7 +23,7 @@ func TestPanic(t *testing.T) {
 	defer client.Leave()
 	client.Join("localhost:50000")
 
-	reply, _, err := client.Request("job", []byte("Hello"), time.Second)
+	reply, _, err := client.Request("job", []byte("Hello"))
 	log.Printf("TestPanic: reply = %s; err = %v", string(reply), err)
 	if err != PanicError {
 		t.Fatalf("Server didn't panic")

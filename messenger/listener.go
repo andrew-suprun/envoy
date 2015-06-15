@@ -61,13 +61,7 @@ func (lsnr *listener) handleAccept(_ string, _ []interface{}) {
 		return
 	}
 
-	err = lsnr.writeJoinAccept(conn)
-	if err != nil {
-		Log.Errorf("Failed to write join accept: err = %v", err)
-		return
-	}
-
-	lsnr.msgr.Send("connected", hostId(conn.RemoteAddr().String()), conn, joinMsg)
+	lsnr.msgr.Send("accepted", hostId(conn.RemoteAddr().String()), conn, joinMsg)
 }
 
 func (lsnr *listener) readJoinInvite(conn net.Conn) (*joinMessage, error) {
@@ -77,17 +71,9 @@ func (lsnr *listener) readJoinInvite(conn net.Conn) (*joinMessage, error) {
 	}
 
 	buf := bytes.NewBuffer(msg.Body)
-	var reply *joinMessage
-	decode(buf, reply)
-	return reply, nil
-}
-
-func (lsnr *listener) writeJoinAccept(conn net.Conn) error {
-	responseChan := make(chan *joinMessage)
-	lsnr.msgr.Send("join-accept", responseChan)
-	buf := &bytes.Buffer{}
-	encode(<-responseChan, buf)
-	return writeMessage(conn, &message{MessageId: newId(), MessageType: join, Body: buf.Bytes()})
+	var reply joinMessage
+	decode(buf, &reply)
+	return &reply, nil
 }
 
 func (lsnr *listener) logf(format string, params ...interface{}) {

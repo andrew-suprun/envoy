@@ -34,7 +34,7 @@ func (reader *reader) handleReadMessage(_ string, _ []interface{}) {
 	if err != nil {
 		reader.recipient.Send("network-error", reader.hostId, err)
 	} else {
-		reader.recipient.Send("read", msg)
+		reader.recipient.Send("message", reader.hostId, msg)
 		reader.Send("read-message")
 	}
 }
