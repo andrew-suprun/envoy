@@ -25,13 +25,14 @@ var (
 
 var RedialInterval = 10 * time.Second
 var Log Logger = &defaultLogger{}
+var Timeout = time.Duration(30 * time.Second)
 
 type Messenger interface {
 	Join(remotes ...string)
 	Leave()
 
-	Request(topic string, body []byte, timeout time.Duration) ([]byte, MessageId, error)
-	Survey(topic string, body []byte, timeout time.Duration) ([][]byte, error)
+	Request(topic string, body []byte) ([]byte, MessageId, error)
+	Survey(topic string, body []byte) ([][]byte, error)
 	Publish(topic string, body []byte) (MessageId, error)
 	Broadcast(topic string, body []byte) error
 
@@ -131,11 +132,10 @@ func NewMessenger(local string) (Messenger, error) {
 	msgr.Actor = actor.NewActor(string(msgr.hostId)+"-messenger").
 		RegisterHandler("join", msgr.handleJoin).
 		RegisterHandler("connected", msgr.handleConnected).
-		RegisterHandler("network-error", msgr.handleNetworkError).
+		RegisterHandler("write-result", msgr.handleWriteResult).
 		RegisterHandler("subscribe", msgr.handleSubscribe).
 		RegisterHandler("unsubscribe", msgr.handleUnsubscribe).
-		RegisterHandler("publish", msgr.handlePublish).
-		RegisterHandler("request", msgr.handleRequest).
+		RegisterHandler("send-message", msgr.handleSendMessage).
 		// RegisterHandler("new-client", msgr.handleNewClient).
 		// RegisterHandler("join-accept", msgr.handleJoinAccept).
 		// RegisterHandler("server-started", msgr.handleServerStarted).
@@ -212,6 +212,7 @@ func (msgr *messenger) handleConnected(_ string, info []interface{}) {
 	}
 }
 
+// todo: fugure out async shutdown
 func (msgr *messenger) shutdown(peer *peer) {
 	// todo: graceful shutdown
 	peer.conn.Close()
@@ -274,15 +275,25 @@ func (msgr *messenger) runHandlerProtected(msg *message, handler Handler) (resul
 
 }
 
-func (msgr *messenger) handleNetworkError(_ string, info []interface{}) {
+func (msgr *messenger) handleWriteResult(_ string, info []interface{}) {
 	peerId := info[0].(hostId)
-	err := info[1].(error)
-	Log.Errorf("%s: network error on %s: %v", peerId, err)
+	msg := info[1].(*message)
+	err := info[2].(error)
+
 	peer := msgr.peers[peerId]
 	if peer != nil {
-		delete(msgr.peers, peerId)
-		// todo: fugure out async shutdown
-		msgr.shutdown(peer)
+		if err != nil {
+			Log.Errorf("%s: network error on %s: %v", peerId, err)
+			delete(msgr.peers, peerId)
+			msgr.shutdown(peer)
+		}
+
+		if msg.MessageType == publish {
+			if replyChan, exists := peer.pendingReplies[msg.MessageId]; exists {
+				delete(peer.pendingReplies, msg.MessageId)
+				replyChan <- &actorMessage{nil, err}
+			}
+		}
 	}
 }
 
@@ -353,42 +364,43 @@ func (msgr *messenger) handleLeave(_ string, _ []interface{}) {
 }
 
 func (msgr *messenger) Publish(t string, body []byte) (MessageId, error) {
+	_, msgId, err := msgr.sendMessage(topic(t), body, publish)
+	return msgId, err
+}
+
+func (msgr *messenger) Request(t string, body []byte) ([]byte, MessageId, error) {
+	return msgr.sendMessage(topic(t), body, request)
+}
+
+func (msgr *messenger) sendMessage(topic topic, body []byte, msgType messageType) ([]byte, MessageId, error) {
 	msg := &message{
 		MessageId:   newId(),
-		MessageType: publish,
-		Topic:       topic(t),
+		MessageType: msgType,
+		Topic:       topic,
 		Body:        body,
 	}
 	replyChan := make(chan *actorMessage)
-	msgr.Send("publish", msg, replyChan)
-	reply <- replyChan
-	return reply.message, msg.MessageId, reply.error
+	time.AfterFunc(Timeout, func() { replyChan <- &actorMessage{nil, TimeoutError} })
+	for {
+		msgr.Send("send-message", msg, replyChan)
+		reply := <-replyChan
+		if reply.error == nil || reply.error == NoSubscribersError {
+			return reply.Body, msg.MessageId, reply.error
+		}
+	}
 }
 
-func (msgr *messenger) handlePublish(_ string, info []interface{}) {
-	timeoutChan := time.After(timeout)
+func (msgr *messenger) handleSendMessage(_ string, info []interface{}) {
 	msg := info[0].(*message)
 	replyChan := info[1].(chan *actorMessage)
 
-	for {
-		server := msgr.selectTopicServer(topic(_topic))
-		if server == nil {
-			replyChan <- &actorMessage{error: NoSubscribersError}
-			return
-		}
-		server.writer.Send("write", msg)
-		select {
-		case <-timeoutChan:
-			replyChan <- &actorMessage{error: TimeoutError}
-			return
-		case reply := <-replyChan:
-			if reply.error == ServerDisconnectedError {
-				delete(msgr.servers, server.hostId)
-				continue
-			}
-			return reply.message.Body, msg.MessageId, reply.error
-		}
+	server := msgr.selectTopicServer(msg.Topic)
+	if server == nil {
+		replyChan <- &actorMessage{nil, NoSubscribersError}
+		return
 	}
+	server.pendingReplies[msg.MessageId] = replyChan
+	server.writer.Send("write", msg)
 }
 
 func (msgr *messenger) Broadcast(_topic string, body []byte) error {
@@ -404,49 +416,23 @@ func (msgr *messenger) Broadcast(_topic string, body []byte) error {
 		Body:        body,
 	}
 
-	for _, server := range servers {
-		server.Send("publish", msg)
-	}
+	// TODO
+	_ = msg
 
 	return nil
 }
 
-func (msgr *messenger) Request(_topic string, body []byte, timeout time.Duration) ([]byte, MessageId, error) {
-	msg := &message{
-		MessageId:   newId(),
-		MessageType: request,
-		Topic:       topic(_topic),
-		Body:        body,
-	}
-	replyChan := make(chan *actorMessage)
-	msgr.Send("request", msg, replyChan)
-	reply <- replyChan
-	return reply.message, msg.MessageId, reply.error
-}
-
 func (msgr *messenger) handleRequest(_ string, info []interface{}) {
-	timeoutChan := time.After(timeout)
 	msg := info[0].(*message)
 	replyChan := info[1].(chan *actorMessage)
-	for {
-		server := msgr.selectTopicServer(topic(_topic))
-		if server == nil {
-			replyChan <- &actorMessage{error: NoSubscribersError}
-			return
-		}
-		server.Send("request", msg, replyChan)
-		select {
-		case <-timeoutChan:
-			replyChan <- &actorMessage{error: TimeoutError}
-			return
-		case reply := <-replyChan:
-			if reply.error == ServerDisconnectedError {
-				delete(msgr.servers, server.hostId)
-				continue
-			}
-			return reply.message.Body, msg.MessageId, reply.error
-		}
+
+	server := msgr.selectTopicServer(msg.Topic)
+	if server == nil {
+		replyChan <- &actorMessage{nil, NoSubscribersError}
+		return
 	}
+	server.pendingReplies[msg.MessageId] = replyChan
+	server.writer.Send("write", msg)
 }
 
 func (msgr *messenger) selectTopicServer(t topic) *peer {
@@ -457,9 +443,9 @@ func (msgr *messenger) selectTopicServer(t topic) *peer {
 	return servers[mRand.Intn(len(servers))]
 }
 
-func (msgr *messenger) getServersByTopic(t topic) []*serverActor {
-	result := []*serverActor{}
-	for _, server := range msgr.servers {
+func (msgr *messenger) getServersByTopic(t topic) []*peer {
+	result := []*peer{}
+	for _, server := range msgr.peers {
 		if _, found := server.topics[t]; found {
 			result = append(result, server)
 		}
@@ -467,7 +453,8 @@ func (msgr *messenger) getServersByTopic(t topic) []*serverActor {
 	return result
 }
 
-func (msgr *messenger) Survey(topic string, body []byte, timeout time.Duration) ([][]byte, error) {
+func (msgr *messenger) Survey(topic string, body []byte) ([][]byte, error) {
+	// TODO
 	return nil, nil
 }
 
@@ -497,10 +484,8 @@ func (mType messageType) String() string {
 		return "reply"
 	case replyPanic:
 		return "replyPanic"
-	case joinInvite:
-		return "joinInvite"
-	case joinAccept:
-		return "joinAccept"
+	case join:
+		return "join"
 	case leaving:
 		return "leaving"
 	case subscribe:
@@ -512,8 +497,8 @@ func (mType messageType) String() string {
 	}
 }
 
-func (h *serverActor) String() string {
-	return fmt.Sprintf("[server: id: %s; topics %d]", h.hostId, len(h.topics))
+func (h *peer) String() string {
+	return fmt.Sprintf("[peer: id: %s; topics %d]", h.peerId, len(h.topics))
 }
 
 func (msg *message) String() string {
@@ -542,15 +527,15 @@ func resolveAddr(addr string) (hostId, error) {
 }
 
 func (msgr *messenger) newJoinMessage() *joinMessage {
-	joinMsg := joinMessage{hostId: msgr.hostId}
+	joinMsg := &joinMessage{HostId: msgr.hostId}
 	for t := range msgr.subscriptions {
-		joinMessage.Topics = append(joinMessage.Topics, t)
+		joinMsg.Topics = append(joinMsg.Topics, t)
 	}
 	for p := range msgr.peers {
-		joinMessage.Peers = append(joinMessage.Peers, p)
+		joinMsg.Peers = append(joinMsg.Peers, p)
 	}
 
-	return joinMessage
+	return joinMsg
 }
 
 func (msgr *messenger) logf(format string, params ...interface{}) {

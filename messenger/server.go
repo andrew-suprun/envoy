@@ -64,8 +64,8 @@ func (srv *server) handleStart(_ string, _ []interface{}) {
 		return
 	}
 
-	srv.reader = newReader(fmt.Sprintf("%s-%s-server-reader", srv.hostId, srv.serverId), conn, srv)
-	srv.writer = newWriter(fmt.Sprintf("%s-%s-server-writer", srv.hostId, srv.serverId), conn, srv)
+	// srv.reader = newReader(fmt.Sprintf("%s-%s-server-reader", srv.hostId, srv.serverId), conn, srv)
+	// srv.writer = newWriter(fmt.Sprintf("%s-%s-server-writer", srv.hostId, srv.serverId), conn, srv)
 
 	srv.msgr.Send("server-started", srv.serverId, reply)
 	return
@@ -121,17 +121,17 @@ func (srv *server) handleError(_ string, info []interface{}) {
 func writeJoinInvite(hostId hostId, conn net.Conn) error {
 	buf := &bytes.Buffer{}
 	encode(hostId, buf)
-	return writeMessage(conn, &message{MessageId: newId(), MessageType: joinInvite, Body: buf.Bytes()})
+	return writeMessage(conn, &message{MessageId: newId(), MessageType: join, Body: buf.Bytes()})
 }
 
-func readJoinAccept(conn net.Conn) (*joinAcceptBody, error) {
+func readJoinAccept(conn net.Conn) (*joinMessage, error) {
 	joinMsg, err := readMessage(conn)
 	if err != nil {
 		return nil, err
 	}
 
 	buf := bytes.NewBuffer(joinMsg.Body)
-	reply := &joinAcceptBody{}
+	reply := &joinMessage{}
 	decode(buf, reply)
 	return reply, nil
 }

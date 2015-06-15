@@ -10,16 +10,16 @@ type writer struct {
 	hostId
 	actor.Actor
 	net.Conn
-	recipient actor.Actor
+	msgr actor.Actor
 }
 
-func newWriter(name string, hostId hostId, conn net.Conn, recipient actor.Actor) actor.Actor {
+func newWriter(name string, hostId hostId, conn net.Conn, msgr actor.Actor) actor.Actor {
 	writer := &writer{
-		name:      name,
-		hostId:    hostId,
-		Actor:     actor.NewActor(name),
-		Conn:      conn,
-		recipient: recipient,
+		name:   name,
+		hostId: hostId,
+		Actor:  actor.NewActor(name),
+		Conn:   conn,
+		msgr:   msgr,
 	}
 
 	return writer.
@@ -28,10 +28,9 @@ func newWriter(name string, hostId hostId, conn net.Conn, recipient actor.Actor)
 }
 
 func (writer *writer) handleWrite(_ string, info []interface{}) {
-	err := writeMessage(writer.Conn, info[0].(*message))
-	if err != nil {
-		writer.recipient.Send("network-error", writer.hostId, err)
-	}
+	msg := info[0].(*message)
+	err := writeMessage(writer.Conn, msg)
+	writer.msgr.Send("write-result", writer.hostId, msg, err)
 }
 
 func (writer *writer) handleStop(_ string, _ []interface{}) {
