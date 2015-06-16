@@ -5,7 +5,6 @@ import (
 	"github.com/andrew-suprun/envoy/actor"
 	"github.com/andrew-suprun/envoy/future"
 	"net"
-	"time"
 )
 
 type dialer struct {
@@ -20,7 +19,7 @@ func newDialer(name string, msgr actor.Actor) actor.Actor {
 		Actor: actor.NewActor(name),
 		msgr:  msgr,
 	}
-	dialer.RegisterHandler("dial", dialer.handleDial)
+	dialer.RegisterHandler("dial", dialer.handleDial).Start()
 	return dialer
 }
 
@@ -31,11 +30,6 @@ func (dialer *dialer) handleDial(_ string, info []interface{}) {
 	if len(info) > 2 && info[2] != nil {
 		result = info[2].(future.Future)
 	}
-
-	dialer.logf("handleDial: addr = %s; joinMsg = %v; result = %s", addr, joinMsg, result)
-	defer func() {
-		dialer.logf("handleDial: done")
-	}()
 
 	buf := &bytes.Buffer{}
 	encode(joinMsg, buf)
@@ -51,22 +45,19 @@ func (dialer *dialer) handleDial(_ string, info []interface{}) {
 
 	conn, err := net.Dial("tcp", string(addr))
 	if err != nil {
-		Log.Errorf("Failed to connect to '%s'. Will re-try.", addr)
-		dialer.redial(addr, joinMsg, result)
+		dialer.reportDialError(addr, result, err)
 		return
 	}
 
 	err = writeMessage(conn, msg)
 	if err != nil {
-		Log.Errorf("Failed to invite '%s'. Will re-try.", addr)
-		dialer.redial(addr, joinMsg, result)
+		dialer.reportDialError(addr, result, err)
 		return
 	}
 
 	replyMsg, err := readMessage(conn)
 	if err != nil {
-		Log.Errorf("Failed to read join accept from '%s'. Will re-try.", conn)
-		dialer.redial(addr, joinMsg, result)
+		dialer.reportDialError(addr, result, err)
 		return
 	}
 
@@ -74,15 +65,16 @@ func (dialer *dialer) handleDial(_ string, info []interface{}) {
 	reply := &joinMessage{}
 	decode(buf, reply)
 
-	dialer.msgr.Send("dialed", addr, conn, reply, result)
+	dialer.msgr.Send("dialed", conn, reply, result)
 
 	return
 }
-
-func (dialer *dialer) redial(addr hostId, joinMsg *joinMessage, result future.Future) {
-	time.AfterFunc(RedialInterval, func() {
-		dialer.Send("dial", addr, joinMsg, result)
-	})
+func (dialer *dialer) reportDialError(peerId hostId, result future.Future, err error) {
+	Log.Errorf("Failed to dial '%s'. Will re-try.", peerId)
+	if result != nil {
+		result.SetError(err)
+	}
+	dialer.msgr.Send("dial-error", peerId)
 }
 
 func (dialer *dialer) logf(format string, params ...interface{}) {

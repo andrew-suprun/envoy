@@ -25,7 +25,8 @@ func newListener(name string, msgr actor.Actor, joinMsg *joinMessage) (actor.Act
 	lsnr.
 		RegisterHandler("set-join-message", lsnr.handleSetJoinMessage).
 		RegisterHandler("accept", lsnr.handleAccept).
-		RegisterHandler("stop", lsnr.handleStop)
+		RegisterHandler("stop", lsnr.handleStop).
+		Start()
 
 	var err error
 	lsnr.Listener, err = net.Listen("tcp", string(lsnr.joinMsg.HostId))
@@ -61,7 +62,7 @@ func (lsnr *listener) handleAccept(_ string, _ []interface{}) {
 		return
 	}
 
-	lsnr.msgr.Send("accepted", hostId(conn.RemoteAddr().String()), conn, joinMsg)
+	lsnr.msgr.Send("accepted", conn, joinMsg)
 }
 
 func (lsnr *listener) readJoinInvite(conn net.Conn) (*joinMessage, error) {

@@ -24,7 +24,8 @@ func newWriter(name string, hostId hostId, conn net.Conn, msgr actor.Actor) acto
 
 	return writer.
 		RegisterHandler("write", writer.handleWrite).
-		RegisterHandler("stop", writer.handleStop)
+		RegisterHandler("stop", writer.handleStop).
+		Start()
 }
 
 func (writer *writer) handleWrite(_ string, info []interface{}) {

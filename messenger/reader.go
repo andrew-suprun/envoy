@@ -25,6 +25,7 @@ func newReader(name string, hostId hostId, conn net.Conn, recipient actor.Actor)
 	reader.
 		RegisterHandler("read-message", reader.handleReadMessage).
 		RegisterHandler("stop", reader.handleStop).
+		Start().
 		Send("read-message")
 	return reader
 }

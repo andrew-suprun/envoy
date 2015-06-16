@@ -30,8 +30,6 @@ func TestOneOnOne(t *testing.T) {
 	defer client.Leave()
 	client.Join("localhost:50000")
 
-	time.Sleep(time.Second)
-
 	for i := 0; i < 20; i++ {
 		reply, _, err := client.Request("job", []byte("Hello"))
 		if err != nil {
@@ -45,6 +43,8 @@ func TestOneOnOne(t *testing.T) {
 
 func TestOneOnThree(t *testing.T) {
 	log.Println("---------------- TestOneOnThree ----------------")
+
+	Timeout = time.Duration(2 * time.Second)
 
 	server1, err := NewMessenger("localhost:50001")
 	if err != nil {
@@ -76,9 +76,6 @@ func TestOneOnThree(t *testing.T) {
 	}
 	defer client.Leave()
 	client.Join("localhost:50002")
-
-	// TODO: remove sleep
-	time.Sleep(time.Second)
 
 	s1, s2, s3 := 0, 0, 0
 	for i := 0; i < 100; i++ {
@@ -140,9 +137,6 @@ func TestTwoOnTwo(t *testing.T) {
 	defer client2.Leave()
 	client2.Join("localhost:50000")
 
-	// TODO: remove sleep
-	time.Sleep(time.Second)
-
 	c1s1, c1s2, c2s1, c2s2 := 0, 0, 0, 0
 	wg := sync.WaitGroup{}
 	wg.Add(2)
@@ -199,6 +193,8 @@ func TestTwoOnTwo(t *testing.T) {
 func TestDisconnect(t *testing.T) {
 	log.Println("---------------- TestDisconnect ----------------")
 
+	Timeout = 2 * time.Second
+
 	server1, err := NewMessenger("localhost:50000")
 	if err != nil {
 		t.FailNow()
@@ -228,9 +224,6 @@ func TestDisconnect(t *testing.T) {
 	}
 	defer client2.Leave()
 	client2.Join("localhost:50000")
-
-	// TODO: remove sleep
-	time.Sleep(time.Second)
 
 	var c int64 = 0
 	var cc int64
@@ -299,6 +292,45 @@ func TestDisconnect(t *testing.T) {
 	if c1s1 < 25 || c1s2 < 25 || c2s1 < 25 || c2s2 < 25 || c1s1+c1s2 != 100 || c2s1+c2s2 != 100 {
 		t.Errorf("Wrong counts")
 	}
+}
+
+func TestPublish(t *testing.T) {
+	log.Println("---------------- TestPublish ----------------")
+
+	wg := sync.WaitGroup{}
+	wg.Add(20)
+
+	server, err := NewMessenger("localhost:50000")
+	if err != nil {
+		t.FailNow()
+	}
+	defer server.Leave()
+	server.Join()
+	server.Subscribe("job", func(topic string, body []byte) []byte {
+		log.Printf("published = %s/%s", topic, string(body))
+		server.Publish("result", body)
+		return body
+	})
+
+	client, err := NewMessenger("localhost:40000")
+	client.Subscribe("result", func(topic string, body []byte) []byte {
+		log.Printf("client result = %s/%s", topic, string(body))
+		wg.Done()
+		return body
+	})
+	if err != nil {
+		t.FailNow()
+	}
+	defer client.Leave()
+	client.Join("localhost:50000")
+
+	for i := 0; i < 20; i++ {
+		_, err := client.Publish("job", []byte("Hello"))
+		if err != nil {
+			t.Fatalf("Request returned error: %s", err)
+		}
+	}
+	wg.Wait()
 }
 
 func echo(topic string, body []byte) []byte {
