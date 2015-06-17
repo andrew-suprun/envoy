@@ -26,7 +26,10 @@ func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	log.SetFlags(log.Lmicroseconds)
 	flag.Parse()
-	msgr := messenger.NewMessenger()
+	msgr, err := messenger.NewMessenger(*localAddrFlag)
+	if err != nil {
+		log.Printf("Error: %v", err)
+	}
 	msgr.Subscribe("job", handler)
 
 	remotes := []string{}
@@ -38,10 +41,7 @@ func main() {
 		workers <- struct{}{}
 	}
 
-	err := msgr.Join(*localAddrFlag, remotes...)
-	if err != nil {
-		log.Printf("Error: %v", err)
-	}
+	msgr.Join(remotes...)
 
 	sigs := make(chan os.Signal)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)

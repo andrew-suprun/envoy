@@ -13,6 +13,7 @@ type listener struct {
 	net.Listener
 	joinMsg *joinMessage
 	msgr    actor.Actor
+	stopped bool
 }
 
 func newListener(name string, msgr actor.Actor, joinMsg *joinMessage) (actor.Actor, error) {
@@ -44,21 +45,30 @@ func (lsnr *listener) handleSetJoinMessage(_ string, info []interface{}) {
 }
 
 func (lsnr *listener) handleStop(_ string, _ []interface{}) {
+	lsnr.stopped = true
 	lsnr.Listener.Close()
 }
 
 func (lsnr *listener) handleAccept(_ string, _ []interface{}) {
-	defer lsnr.Send("accept")
+	defer func() {
+		if !lsnr.stopped {
+			lsnr.Send("accept")
+		}
+	}()
 
 	conn, err := lsnr.Listener.Accept()
 	if err != nil {
-		Log.Errorf("Failed to accept connection: err = %v", err)
+		if !lsnr.stopped {
+			Log.Errorf("Failed to accept connection: err = %v", err)
+		}
 		return
 	}
 
 	joinMsg, err := lsnr.readJoinInvite(conn)
 	if err != nil {
-		Log.Errorf("Failed to read join invite: err = %v", err)
+		if !lsnr.stopped {
+			Log.Errorf("Failed to read join invite: err = %v", err)
+		}
 		return
 	}
 

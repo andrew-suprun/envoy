@@ -57,16 +57,14 @@ func main() {
 }
 
 func run() {
-	msgr := messenger.NewMessenger()
-	remotes := strings.Split(*remoteAddrFlag, ",")
-	msgr.Subscribe("client1", handler)
-	if len(remotes) > 0 {
-		err := msgr.Join(*localAddrFlag, remotes...)
-		if err != nil {
-			fmt.Printf("Failed to join. Exiting\n")
-			os.Exit(1)
-		}
+	msgr, err := messenger.NewMessenger(*localAddrFlag)
+	if err != nil {
+		fmt.Printf("Failed to join. Exiting\n")
+		os.Exit(1)
 	}
+	msgr.Subscribe("client1", handler)
+	remotes := strings.Split(*remoteAddrFlag, ",")
+	msgr.Join(remotes...)
 
 	buf := make([]byte, msgSize)
 	wg.Add(threads)
@@ -78,7 +76,7 @@ func run() {
 				start := time.Now()
 
 				// err := msgr.Publish("job", buf)
-				_, err := msgr.Request("job", buf, 30*time.Second)
+				_, _, err := msgr.Request("job", buf)
 
 				duration := time.Now().Sub(start)
 				maxDurationMutex.Lock()

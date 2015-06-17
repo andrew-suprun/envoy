@@ -70,7 +70,6 @@ func (dialer *dialer) handleDial(_ string, info []interface{}) {
 	return
 }
 func (dialer *dialer) reportDialError(peerId hostId, result future.Future, err error) {
-	Log.Errorf("Failed to dial '%s'. Will re-try.", peerId)
 	if result != nil {
 		result.SetError(err)
 	}

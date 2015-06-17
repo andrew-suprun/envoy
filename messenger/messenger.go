@@ -190,6 +190,7 @@ func (msgr *messenger) handleConnected(msgType string, info []interface{}) {
 	peer, found := msgr.peers[reply.HostId]
 
 	if found && peer.connected {
+		// msgr.logf("handleConnected: closing %s/%s: already connected as peer %s: conn = %s/%s", conn.LocalAddr(), conn.RemoteAddr(), peer.conn.LocalAddr(), peer.conn.RemoteAddr())
 		conn.Close()
 		return
 	}
@@ -218,6 +219,7 @@ func (msgr *messenger) handleConnected(msgType string, info []interface{}) {
 	}
 
 	peer.connected = true
+	Log.Infof("Peer %s joined. (%s)", peer.peerId, msgType)
 
 	for _, peerId := range reply.Peers {
 		if _, found := msgr.peers[peerId]; !found {
@@ -296,6 +298,8 @@ func (msgr *messenger) handleMessage(_ string, info []interface{}) {
 		msgr.handleSubscribed(peer, msg)
 	case unsubscribe:
 		msgr.handleUnsubscribed(peer, msg)
+	case leaving:
+		msgr.handleLeaving(peer, msg)
 	default:
 		panic(fmt.Sprintf("received message: %v", msg))
 	}
@@ -304,17 +308,38 @@ func (msgr *messenger) handleMessage(_ string, info []interface{}) {
 func (msgr *messenger) handleNetworkError(_ string, info []interface{}) {
 	peerId := info[0].(hostId)
 	err := info[1].(error)
-	Log.Errorf("Network error: %v", err)
+	if _, found := msgr.peers[peerId]; found {
+		if err.Error() == "EOF" {
+			Log.Errorf("Peer %s disconnected. Will try to re-connect.", peerId)
+		} else {
+			Log.Errorf("Peer %s: Network error: %v. Will try to re-connect.", peerId, err)
+		}
+	}
 	if peer, found := msgr.peers[peerId]; found {
 		msgr.shutdownPeer(peer)
-	}
-	if peerId > msgr.hostId {
-		msgr.requestDial(peerId, nil)
+
+		if peerId > msgr.hostId {
+			msgr.requestDial(peerId, nil)
+		} else {
+			time.AfterFunc(RedialInterval, func() {
+				msgr.requestDial(peerId, nil)
+			})
+		}
 	}
 }
 
 func (msgr *messenger) handleDialError(_ string, info []interface{}) {
 	peerId := info[0].(hostId)
+	peer := msgr.peers[peerId]
+	if peer != nil {
+		if peer.conn != nil {
+			if peer.connected {
+				return
+			}
+		}
+		msgr.shutdownPeer(peer)
+	}
+	Log.Errorf("Failed to dial '%s'. Will re-dial.", peerId)
 	time.AfterFunc(RedialInterval, func() {
 		msgr.requestDial(peerId, nil)
 	})
@@ -358,6 +383,11 @@ func (msgr *messenger) handleUnsubscribed(peer *peer, msg *message) {
 	var t topic
 	decode(buf, &t)
 	delete(peer.topics, t)
+}
+
+func (msgr *messenger) handleLeaving(peer *peer, msg *message) {
+	Log.Infof("Peer %s left.", peer.peerId)
+	msgr.shutdownPeer(peer)
 }
 
 func (msgr *messenger) runHandler(peer *peer, msg *message, handler Handler) {
