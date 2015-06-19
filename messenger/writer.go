@@ -35,8 +35,8 @@ func (writer *writer) handleWrite(_ string, info []interface{}) {
 }
 
 func (writer *writer) handleStop(_ string, _ []interface{}) {
-	writeMessage(writer.Conn, &message{MessageType: leaving})
-	writer.Close()
+	// writeMessage(writer.Conn, &message{MessageType: leaving})
+	// writer.Close()
 }
 
 func (writer *writer) logf(format string, params ...interface{}) {

@@ -6,11 +6,13 @@ import (
 	"github.com/andrew-suprun/envoy/messenger"
 	"log"
 	"os"
+	"os/signal"
 	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -65,6 +67,15 @@ func run() {
 	msgr.Subscribe("client1", handler)
 	remotes := strings.Split(*remoteAddrFlag, ",")
 	msgr.Join(remotes...)
+
+	sigs := make(chan os.Signal)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		for {
+			<-sigs
+			done = true
+		}
+	}()
 
 	buf := make([]byte, msgSize)
 	wg.Add(threads)

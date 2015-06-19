@@ -50,7 +50,7 @@ func main() {
 			<-sigs
 			fmt.Println("\nLeaving...")
 			msgr.Leave()
-			fmt.Println("Buy.")
+			fmt.Println("Bye.")
 			os.Exit(0)
 		}
 	}()

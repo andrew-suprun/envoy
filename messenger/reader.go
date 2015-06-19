@@ -11,7 +11,6 @@ type reader struct {
 	actor.Actor
 	net.Conn
 	recipient actor.Actor
-	stopped   bool
 }
 
 func newReader(name string, hostId hostId, conn net.Conn, recipient actor.Actor) actor.Actor {
@@ -25,16 +24,12 @@ func newReader(name string, hostId hostId, conn net.Conn, recipient actor.Actor)
 
 	reader.
 		RegisterHandler("read-message", reader.handleReadMessage).
-		RegisterHandler("stop", reader.handleStop).
 		Start().
 		Send("read-message")
 	return reader
 }
 
 func (reader *reader) handleReadMessage(_ string, _ []interface{}) {
-	if reader.stopped {
-		return
-	}
 	msg, err := readMessage(reader.Conn)
 	if err != nil {
 		reader.recipient.Send("network-error", reader.hostId, err)
@@ -42,10 +37,6 @@ func (reader *reader) handleReadMessage(_ string, _ []interface{}) {
 		reader.recipient.Send("message", reader.hostId, msg)
 		reader.Send("read-message")
 	}
-}
-
-func (reader *reader) handleStop(_ string, _ []interface{}) {
-	reader.stopped = true
 }
 
 func (reader *reader) logf(format string, params ...interface{}) {

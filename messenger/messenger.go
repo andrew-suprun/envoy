@@ -11,7 +11,6 @@ import (
 	mRand "math/rand"
 	"net"
 	"runtime/debug"
-	"sync"
 	"time"
 )
 
@@ -58,6 +57,7 @@ const (
 	replyPanic
 	join
 	leaving
+	left
 	subscribe
 	unsubscribe
 )
@@ -80,7 +80,16 @@ type messenger struct {
 	peers         map[hostId]*peer
 	listener      actor.Actor
 	dialer        actor.Actor
+	state         messengerState
+	leaveFuture   future.Future
 }
+
+type messengerState int
+
+const (
+	messengerActive messengerState = iota
+	messengerLeaving
+)
 
 type peer struct {
 	msgr           actor.Actor
@@ -89,11 +98,19 @@ type peer struct {
 	conn           net.Conn
 	topics         map[topic]struct{}
 	pendingReplies map[messageId]future.Future
-	inflight       sync.WaitGroup
 	reader         actor.Actor
 	writer         actor.Actor
-	connected      bool
+	state          peerState
 }
+
+type peerState int
+
+const (
+	peerInitial peerState = iota
+	peerConnected
+	peerStopping
+	peerLeaving
+)
 
 type message struct {
 	MessageId   messageId   `codec:"id"`
@@ -141,6 +158,8 @@ func NewMessenger(local string) (Messenger, error) {
 		RegisterHandler("message", msgr.handleMessage).
 		RegisterHandler("network-error", msgr.handleNetworkError).
 		RegisterHandler("dial-error", msgr.handleDialError).
+		RegisterHandler("shutdown-peer", msgr.handleShutdownPeer).
+		RegisterHandler("shutdown-messenger", msgr.handleShutdownMessenger).
 		Start()
 
 	msgr.listener, err = newListener(string(msgr.hostId)+"-listener", msgr, msgr.newJoinMessage())
@@ -170,10 +189,16 @@ func (msgr *messenger) Join(remotes ...string) {
 
 func (msgr *messenger) handleDial(_ string, info []interface{}) {
 	peerId := info[0].(hostId)
-	result := info[1].(future.Future)
-	_, found := msgr.peers[peerId]
-	if !found {
-		msgr.requestDial(peerId, result)
+	var result future.Future
+	if len(info) > 1 {
+		result = info[1].(future.Future)
+	}
+	if peerId != msgr.hostId {
+		_, found := msgr.peers[peerId]
+		if !found {
+			msgr.peers[peerId] = msgr.newPeer(peerId)
+			msgr.dialer.Send("dial", peerId, msgr.newJoinMessage(), result)
+		}
 	}
 }
 
@@ -189,8 +214,7 @@ func (msgr *messenger) handleConnected(msgType string, info []interface{}) {
 
 	peer, found := msgr.peers[reply.HostId]
 
-	if found && peer.connected {
-		// msgr.logf("handleConnected: closing %s/%s: already connected as peer %s: conn = %s/%s", conn.LocalAddr(), conn.RemoteAddr(), peer.conn.LocalAddr(), peer.conn.RemoteAddr())
+	if found && peer.state == peerConnected {
 		conn.Close()
 		return
 	}
@@ -213,42 +237,48 @@ func (msgr *messenger) handleConnected(msgType string, info []interface{}) {
 
 		err := writeMessage(conn, msg)
 		if err != nil {
-			msgr.shutdownPeer(peer)
+			msgr.Send("shutdown-peer", peer.peerId)
 			return
 		}
 	}
 
-	peer.connected = true
+	peer.state = peerConnected
 	Log.Infof("Peer %s joined. (%s)", peer.peerId, msgType)
 
 	for _, peerId := range reply.Peers {
 		if _, found := msgr.peers[peerId]; !found {
-			msgr.requestDial(peerId, nil)
+			msgr.Send("dial", peerId)
 		}
 	}
 }
 
-func (msgr *messenger) requestDial(peerId hostId, result future.Future) {
-	if peerId != msgr.hostId {
-		if _, exist := msgr.peers[peerId]; !exist {
-			msgr.peers[peerId] = msgr.newPeer(peerId)
-			msgr.dialer.Send("dial", peerId, msgr.newJoinMessage(), result)
-		}
+func (msgr *messenger) handleShutdownPeer(_ string, info []interface{}) {
+	peerId := info[0].(hostId)
+	peer := msgr.peers[peerId]
+	if peer == nil {
+		return
 	}
-}
 
-// todo: fugure out async shutdown
-func (msgr *messenger) shutdownPeer(peer *peer) {
-	// todo: graceful shutdown
-	delete(msgr.peers, peer.peerId)
+	// Log.Debugf("stopPeer: disconnected: %d", len(peer.pendingReplies))
 	for _, pending := range peer.pendingReplies {
 		pending.SetError(ServerDisconnectedError)
 	}
+	delete(msgr.peers, peer.peerId)
 	peer.pendingReplies = nil
 	if peer.conn != nil {
+		if peer.state == peerLeaving {
+			peer.writer.Send("write", &message{MessageType: left})
+		}
 		peer.reader.Stop()
 		peer.writer.Stop()
 		peer.conn.Close()
+	}
+	msgr.Send("shutdown-messenger")
+}
+
+func (msgr *messenger) handleShutdownMessenger(msgType string, info []interface{}) {
+	if msgr.state == messengerLeaving && msgr.leaveFuture != nil && len(msgr.peers) == 0 {
+		msgr.leaveFuture.SetValue(true)
 	}
 }
 
@@ -300,6 +330,8 @@ func (msgr *messenger) handleMessage(_ string, info []interface{}) {
 		msgr.handleUnsubscribed(peer, msg)
 	case leaving:
 		msgr.handleLeaving(peer, msg)
+	case left:
+		msgr.handleLeft(peer, msg)
 	default:
 		panic(fmt.Sprintf("received message: %v", msg))
 	}
@@ -308,21 +340,28 @@ func (msgr *messenger) handleMessage(_ string, info []interface{}) {
 func (msgr *messenger) handleNetworkError(_ string, info []interface{}) {
 	peerId := info[0].(hostId)
 	err := info[1].(error)
-	if _, found := msgr.peers[peerId]; found {
+	if msgr.state == messengerLeaving {
+		msgr.Send("shutdown-peer", peerId)
+		return
+	}
+	if peer, found := msgr.peers[peerId]; found {
+		if peer.state == peerStopping || peer.state == peerLeaving {
+			return
+		}
+		peer.state = peerStopping
 		if err.Error() == "EOF" {
 			Log.Errorf("Peer %s disconnected. Will try to re-connect.", peerId)
 		} else {
 			Log.Errorf("Peer %s: Network error: %v. Will try to re-connect.", peerId, err)
 		}
-	}
-	if peer, found := msgr.peers[peerId]; found {
-		msgr.shutdownPeer(peer)
+
+		msgr.Send("shutdown-peer", peer.peerId)
 
 		if peerId > msgr.hostId {
-			msgr.requestDial(peerId, nil)
+			msgr.Send("dial", peerId)
 		} else {
 			time.AfterFunc(RedialInterval, func() {
-				msgr.requestDial(peerId, nil)
+				msgr.Send("dial", peerId)
 			})
 		}
 	}
@@ -333,15 +372,15 @@ func (msgr *messenger) handleDialError(_ string, info []interface{}) {
 	peer := msgr.peers[peerId]
 	if peer != nil {
 		if peer.conn != nil {
-			if peer.connected {
+			if peer.state == peerConnected {
 				return
 			}
 		}
-		msgr.shutdownPeer(peer)
+		msgr.Send("shutdown-peer", peer.peerId)
 	}
 	Log.Errorf("Failed to dial '%s'. Will re-dial.", peerId)
 	time.AfterFunc(RedialInterval, func() {
-		msgr.requestDial(peerId, nil)
+		msgr.Send("dial", peerId)
 	})
 }
 
@@ -386,8 +425,40 @@ func (msgr *messenger) handleUnsubscribed(peer *peer, msg *message) {
 }
 
 func (msgr *messenger) handleLeaving(peer *peer, msg *message) {
-	Log.Infof("Peer %s left.", peer.peerId)
-	msgr.shutdownPeer(peer)
+	peer.state = peerLeaving
+
+	pendingFutures := make([]future.Future, len(peer.pendingReplies))
+	for _, pf := range peer.pendingReplies {
+		pendingFutures = append(pendingFutures, pf)
+	}
+	go stopPeer(peer, pendingFutures, msgr)
+}
+
+func (msgr *messenger) handleLeft(peer *peer, msg *message) {
+	peer.state = peerStopping
+	if peer == nil {
+		return
+	}
+
+	pendingFutures := make([]future.Future, len(peer.pendingReplies))
+	for _, pf := range peer.pendingReplies {
+		pendingFutures = append(pendingFutures, pf)
+	}
+	go stopPeer(peer, pendingFutures, msgr)
+}
+
+func stopPeer(peer *peer, pendingFutures []future.Future, msgr actor.Actor) {
+	for _, pf := range pendingFutures {
+		if pf != nil {
+			pf.Value()
+		}
+	}
+	msgr.Send("shutdown-peer", peer.peerId)
+	if peer.state == peerLeaving {
+		Log.Infof("Peer %s left.", peer.peerId)
+	}
+	peer.writer.Send("write", &message{MessageType: left})
+
 }
 
 func (msgr *messenger) runHandler(peer *peer, msg *message, handler Handler) {
@@ -435,9 +506,9 @@ func (msgr *messenger) handleWriteResult(_ string, info []interface{}) {
 	peer := msgr.peers[peerId]
 	if peer != nil {
 		if err != nil {
-			msgr.shutdownPeer(peer)
+			msgr.Send("shutdown-peer", peer.peerId)
 			if peerId > msgr.hostId {
-				msgr.requestDial(peerId, nil)
+				msgr.Send("dial", peerId)
 			}
 		}
 
@@ -498,18 +569,21 @@ func (msgr *messenger) clientBroadcast(msgType messageType, body []byte) {
 	}
 
 	for _, to := range msgr.peers {
-		if to.connected {
+		if to.state != peerInitial {
 			to.writer.Send("write", msg)
 		}
 	}
 }
 
 func (msgr *messenger) Leave() {
+	msgr.leaveFuture = future.NewFuture()
+	msgr.state = messengerLeaving
+	msgr.clientBroadcast(leaving, nil)
 	msgr.listener.Stop()
 	msgr.dialer.Stop()
-	for _, peer := range msgr.peers {
-		msgr.shutdownPeer(peer)
-	}
+	msgr.Send("shutdown-messenger")
+	time.AfterFunc(Timeout, func() { msgr.leaveFuture.SetValue(false) })
+	msgr.leaveFuture.Value()
 	msgr.Stop()
 }
 
@@ -588,8 +662,10 @@ func (msgr *messenger) selectTopicServer(t topic) *peer {
 func (msgr *messenger) getServersByTopic(t topic) []*peer {
 	result := []*peer{}
 	for _, server := range msgr.peers {
-		if _, found := server.topics[t]; found {
-			result = append(result, server)
+		if server.state == peerConnected {
+			if _, found := server.topics[t]; found {
+				result = append(result, server)
+			}
 		}
 	}
 	return result
@@ -640,10 +716,21 @@ func (mType messageType) String() string {
 }
 
 func (peer *peer) String() string {
-	if peer.connected {
-		return fmt.Sprintf("[connected peer: id: %s; topics %d]", peer.peerId, len(peer.topics))
-	} else {
-		return fmt.Sprintf("[peer: id: %s; topics %d]", peer.peerId, len(peer.topics))
+	return fmt.Sprintf("[peer: id: %s; topics: %d; state: %s]", peer.peerId, len(peer.topics), peer.state)
+}
+
+func (s peerState) String() string {
+	switch s {
+	case peerInitial:
+		return "initial"
+	case peerConnected:
+		return "connected"
+	case peerStopping:
+		return "stopping"
+	case peerLeaving:
+		return "leaving"
+	default:
+		panic(fmt.Errorf("Unknown peerState %d", s))
 	}
 }
 
