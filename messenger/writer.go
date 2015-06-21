@@ -24,7 +24,6 @@ func newWriter(name string, hostId hostId, conn net.Conn, msgr actor.Actor) acto
 
 	return writer.
 		RegisterHandler("write", writer.handleWrite).
-		RegisterHandler("stop", writer.handleStop).
 		Start()
 }
 
@@ -32,11 +31,6 @@ func (writer *writer) handleWrite(_ string, info []interface{}) {
 	msg := info[0].(*message)
 	err := writeMessage(writer.Conn, msg)
 	writer.msgr.Send("write-result", writer.hostId, msg, err)
-}
-
-func (writer *writer) handleStop(_ string, _ []interface{}) {
-	// writeMessage(writer.Conn, &message{MessageType: leaving})
-	// writer.Close()
 }
 
 func (writer *writer) logf(format string, params ...interface{}) {

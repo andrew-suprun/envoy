@@ -33,10 +33,10 @@ type Messenger interface {
 	Join(remotes ...string)
 	Leave()
 
-	Request(topic string, body []byte) ([]byte, MessageId, error)
-	Survey(topic string, body []byte) ([][]byte, error)
 	Publish(topic string, body []byte) (MessageId, error)
-	Broadcast(topic string, body []byte) error
+	Request(topic string, body []byte) ([]byte, MessageId, error)
+	Broadcast(topic string, body []byte) (MessageId, error)
+	Survey(topic string, body []byte) ([][]byte, MessageId, error)
 
 	// No more then one subscription per topic.
 	// Second subscription panics.
@@ -152,9 +152,8 @@ func NewMessenger(local string) (Messenger, error) {
 		RegisterHandler("dialed", msgr.handleConnected).
 		RegisterHandler("accepted", msgr.handleConnected).
 		RegisterHandler("write-result", msgr.handleWriteResult).
-		RegisterHandler("subscribe", msgr.handleSubscribe).
-		RegisterHandler("unsubscribe", msgr.handleUnsubscribe).
 		RegisterHandler("send-message", msgr.handleSendMessage).
+		RegisterHandler("broadcast-message", msgr.handleBroadcastMessage).
 		RegisterHandler("message", msgr.handleMessage).
 		RegisterHandler("network-error", msgr.handleNetworkError).
 		RegisterHandler("dial-error", msgr.handleDialError).
@@ -162,13 +161,13 @@ func NewMessenger(local string) (Messenger, error) {
 		RegisterHandler("shutdown-messenger", msgr.handleShutdownMessenger).
 		Start()
 
+	msgr.dialer = newDialer(string(msgr.hostId)+"-dialer", msgr)
+
 	msgr.listener, err = newListener(string(msgr.hostId)+"-listener", msgr, msgr.newJoinMessage())
 	if err != nil {
 		msgr.Leave()
 		return nil, err
 	}
-
-	msgr.dialer = newDialer(string(msgr.hostId)+"-dialer", msgr)
 
 	return msgr, nil
 }
@@ -184,7 +183,102 @@ func (msgr *messenger) Join(remotes ...string) {
 			Log.Errorf("Cannot resolve address %s. Ignoring.", remote)
 		}
 	}
+}
 
+func (msgr *messenger) Leave() {
+	msgr.leaveFuture = future.NewFuture()
+	msgr.state = messengerLeaving
+	msgr.broadcastMessage("", nil, leaving)
+	msgr.listener.Stop()
+	msgr.dialer.Stop()
+	msgr.Send("shutdown-messenger")
+	time.AfterFunc(Timeout, func() { msgr.leaveFuture.SetValue(false) })
+	msgr.leaveFuture.Value()
+	msgr.Stop()
+}
+
+func (msgr *messenger) Publish(t string, body []byte) (MessageId, error) {
+	_, msgId, err := msgr.sendMessage(topic(t), body, publish)
+	return msgId, err
+}
+
+func (msgr *messenger) Request(t string, body []byte) ([]byte, MessageId, error) {
+	return msgr.sendMessage(topic(t), body, request)
+}
+
+func (msgr *messenger) Broadcast(t string, body []byte) (MessageId, error) {
+	_, msgId, err := msgr.broadcastMessage(topic(t), body, publish)
+	return msgId, err
+}
+
+func (msgr *messenger) Survey(t string, body []byte) ([][]byte, MessageId, error) {
+	return msgr.broadcastMessage(topic(t), body, request)
+}
+
+func (msgr *messenger) Subscribe(_topic string, handler Handler) {
+	msgr.subscriptions[topic(_topic)] = handler
+	buf := &bytes.Buffer{}
+	encode(_topic, buf)
+	msgr.broadcastMessage("", buf.Bytes(), subscribe)
+}
+
+func (msgr *messenger) Unsubscribe(_topic string) {
+	delete(msgr.subscriptions, topic(_topic))
+	buf := &bytes.Buffer{}
+	encode(_topic, buf)
+	msgr.broadcastMessage("", buf.Bytes(), unsubscribe)
+}
+
+func (msgr *messenger) sendMessage(topic topic, body []byte, msgType messageType) ([]byte, MessageId, error) {
+	msg := &message{
+		MessageId:   newId(),
+		MessageType: msgType,
+		Topic:       topic,
+		Body:        body,
+	}
+	for {
+		reply := future.NewFuture()
+		time.AfterFunc(Timeout, func() { reply.SetError(TimeoutError) })
+		msgr.Send("send-message", msg, reply)
+		replyMsg := reply.Value()
+		err := reply.Error()
+		if replyMsg != nil {
+			return replyMsg.(*message).Body, msg.MessageId, nil
+		} else if err == ServerDisconnectedError {
+			continue
+		} else {
+			return nil, msg.MessageId, err
+		}
+	}
+}
+
+func (msgr *messenger) broadcastMessage(topic topic, body []byte, msgType messageType) ([][]byte, MessageId, error) {
+	msg := &message{
+		MessageId:   newId(),
+		MessageType: msgType,
+		Topic:       topic,
+		Body:        body,
+	}
+	replies := future.NewFuture()
+	msgr.Send("broadcast-message", msg, replies)
+	responses := replies.Value().([]future.Future)
+	time.AfterFunc(Timeout, func() {
+		for _, reply := range responses {
+			reply.SetError(TimeoutError)
+		}
+	})
+	var bodies [][]byte
+	var err error
+	for _, reply := range responses {
+		replyMsg := reply.Value()
+		err := reply.Error()
+		if replyMsg != nil {
+			bodies = append(bodies, replyMsg.(*message).Body)
+		} else if err == nil {
+			err = reply.Error()
+		}
+	}
+	return bodies, msg.MessageId, err
 }
 
 func (msgr *messenger) handleDial(_ string, info []interface{}) {
@@ -378,7 +472,7 @@ func (msgr *messenger) handleDialError(_ string, info []interface{}) {
 		}
 		msgr.Send("shutdown-peer", peer.peerId)
 	}
-	Log.Errorf("Failed to dial '%s'. Will re-dial.", peerId)
+	Log.Errorf("Failed to dial %s. Will re-dial.", peerId)
 	time.AfterFunc(RedialInterval, func() {
 		msgr.Send("dial", peerId)
 	})
@@ -512,7 +606,7 @@ func (msgr *messenger) handleWriteResult(_ string, info []interface{}) {
 			}
 		}
 
-		if msg.MessageType == publish {
+		if msg.MessageType == publish || msg.MessageType == subscribe || msg.MessageType == unsubscribe {
 			if reply, exists := peer.pendingReplies[msg.MessageId]; exists {
 				delete(peer.pendingReplies, msg.MessageId)
 				reply.SetError(err)
@@ -529,96 +623,6 @@ func (msgr *messenger) getTopics() []topic {
 	return topics
 }
 
-func (msgr *messenger) Subscribe(t string, handler Handler) {
-	msgr.Send("subscribe", topic(t), handler)
-}
-
-func (msgr *messenger) handleSubscribe(_ string, info []interface{}) {
-	topic := info[0].(topic)
-	handler := info[1].(Handler)
-	msgr.subscriptions[topic] = handler
-	msgr.broadcastSubscription(subscribe, topic)
-}
-
-func (msgr *messenger) Unsubscribe(t string) {
-	msgr.Send("unsubscribe", topic(t))
-}
-
-func (msgr *messenger) handleUnsubscribe(_ string, info []interface{}) {
-	topic := info[0].(topic)
-	delete(msgr.subscriptions, topic)
-	msgr.broadcastSubscription(unsubscribe, topic)
-}
-
-func (msgr *messenger) broadcastSubscription(msgType messageType, t topic) {
-	buf := &bytes.Buffer{}
-	encode(t, buf)
-	msgr.clientBroadcast(msgType, buf.Bytes())
-}
-
-func (msgr *messenger) clientBroadcast(msgType messageType, body []byte) {
-	if len(msgr.peers) == 0 {
-		return
-	}
-
-	msg := &message{
-		MessageId:   newId(),
-		MessageType: msgType,
-		Topic:       "",
-		Body:        body,
-	}
-
-	for _, to := range msgr.peers {
-		if to.state != peerInitial {
-			to.writer.Send("write", msg)
-		}
-	}
-}
-
-func (msgr *messenger) Leave() {
-	msgr.leaveFuture = future.NewFuture()
-	msgr.state = messengerLeaving
-	msgr.clientBroadcast(leaving, nil)
-	msgr.listener.Stop()
-	msgr.dialer.Stop()
-	msgr.Send("shutdown-messenger")
-	time.AfterFunc(Timeout, func() { msgr.leaveFuture.SetValue(false) })
-	msgr.leaveFuture.Value()
-	msgr.Stop()
-}
-
-func (msgr *messenger) Publish(t string, body []byte) (MessageId, error) {
-	_, msgId, err := msgr.sendMessage(topic(t), body, publish)
-	return msgId, err
-}
-
-func (msgr *messenger) Request(t string, body []byte) ([]byte, MessageId, error) {
-	return msgr.sendMessage(topic(t), body, request)
-}
-
-func (msgr *messenger) sendMessage(topic topic, body []byte, msgType messageType) ([]byte, MessageId, error) {
-	msg := &message{
-		MessageId:   newId(),
-		MessageType: msgType,
-		Topic:       topic,
-		Body:        body,
-	}
-	for {
-		reply := future.NewFuture()
-		time.AfterFunc(Timeout, func() { reply.SetError(TimeoutError) })
-		msgr.Send("send-message", msg, reply)
-		replyMsg := reply.Value()
-		err := reply.Error()
-		if replyMsg != nil {
-			return replyMsg.(*message).Body, msg.MessageId, nil
-		} else if err == ServerDisconnectedError {
-			continue
-		} else {
-			return nil, msg.MessageId, err
-		}
-	}
-}
-
 func (msgr *messenger) handleSendMessage(_ string, info []interface{}) {
 	msg := info[0].(*message)
 	reply := info[1].(future.Future)
@@ -632,23 +636,20 @@ func (msgr *messenger) handleSendMessage(_ string, info []interface{}) {
 	server.writer.Send("write", msg)
 }
 
-func (msgr *messenger) Broadcast(_topic string, body []byte) error {
-	servers := msgr.getServersByTopic(topic(_topic))
-	if len(servers) == 0 {
-		return NoSubscribersError
+func (msgr *messenger) handleBroadcastMessage(_ string, info []interface{}) {
+	msg := info[0].(*message)
+	replies := info[1].(future.Future)
+	responses := make([]future.Future, 0, len(msgr.peers))
+
+	for _, peer := range msgr.peers {
+		if peer.state == peerConnected {
+			response := future.NewFuture()
+			responses = append(responses, response)
+			peer.pendingReplies[msg.MessageId] = response
+			peer.writer.Send("write", msg)
+		}
 	}
-
-	msg := &message{
-		MessageId:   newId(),
-		MessageType: publish,
-		Topic:       topic(_topic),
-		Body:        body,
-	}
-
-	// TODO
-	_ = msg
-
-	return nil
+	replies.SetValue(responses)
 }
 
 func (msgr *messenger) selectTopicServer(t topic) *peer {
@@ -669,11 +670,6 @@ func (msgr *messenger) getServersByTopic(t topic) []*peer {
 		}
 	}
 	return result
-}
-
-func (msgr *messenger) Survey(topic string, body []byte) ([][]byte, error) {
-	// TODO
-	return nil, nil
 }
 
 func (msgr *messenger) connId(conn net.Conn) string {

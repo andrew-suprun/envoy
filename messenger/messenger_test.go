@@ -44,7 +44,7 @@ func TestOneOnOne(t *testing.T) {
 func TestOneOnThree(t *testing.T) {
 	log.Println("---------------- TestOneOnThree ----------------")
 
-	Timeout = time.Duration(2 * time.Second)
+	Timeout = time.Duration(5 * time.Second)
 
 	server1, err := NewMessenger("localhost:50001")
 	if err != nil {
@@ -67,8 +67,11 @@ func TestOneOnThree(t *testing.T) {
 		t.FailNow()
 	}
 	defer server3.Leave()
+	log.Printf("%%%%%% 1")
 	server3.Join("localhost:50002")
+	log.Printf("%%%%%% 2")
 	server3.Subscribe("job", echo3)
+	log.Printf("%%%%%% 3")
 
 	client, err := NewMessenger("localhost:40000")
 	if err != nil {
