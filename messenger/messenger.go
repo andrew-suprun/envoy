@@ -38,7 +38,7 @@ type Messenger interface {
 	Broadcast(topic string, body []byte) (MessageId, error)
 	Survey(topic string, body []byte) ([][]byte, MessageId, error)
 
-	// No more then one subscription per topic.
+	// No more than one subscription per topic.
 	// Second subscription panics.
 	Subscribe(topic string, handler Handler)
 	Unsubscribe(topic string)
