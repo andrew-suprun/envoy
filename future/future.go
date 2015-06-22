@@ -73,10 +73,10 @@ func (f *future) String() string {
 	f.cond.L.Lock()
 	defer f.cond.L.Unlock()
 	if !f.set {
-		return "[feature: pending]"
+		return "[future: pending]"
 	} else if f.err != nil {
-		return fmt.Sprintf("[feature: error=%+v]", f.err)
+		return fmt.Sprintf("[future: error=%+v]", f.err)
 	} else {
-		return fmt.Sprintf("[feature: value=%+v]", f.value)
+		return fmt.Sprintf("[future: value=%+v]", f.value)
 	}
 }
