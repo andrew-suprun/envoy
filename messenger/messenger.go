@@ -732,7 +732,7 @@ func (s peerState) String() string {
 
 func (msg *message) String() string {
 	if msg == nil {
-		return "[message: nil]"
+		return "[message: <nil>]"
 	}
 	if msg.Body != nil {
 		return fmt.Sprintf("[message[%s/%s]: topic: %s; body.len: %d]", msg.MessageId, msg.MessageType, msg.Topic, len(msg.Body))
