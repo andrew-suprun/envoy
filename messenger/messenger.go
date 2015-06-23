@@ -38,7 +38,7 @@ type Messenger interface {
 	Broadcast(topic string, body []byte) (MessageId, error)
 	Survey(topic string, body []byte) ([][]byte, MessageId, error)
 
-	// No more then one subscription per topic.
+	// No more than one subscription per topic.
 	// Second subscription panics.
 	Subscribe(topic string, handler Handler)
 	Unsubscribe(topic string)
@@ -724,7 +724,7 @@ func (s peerState) String() string {
 
 func (msg *message) String() string {
 	if msg == nil {
-		return "[message: nil]"
+		return "[message: <nil>]"
 	}
 	if msg.Body != nil {
 		return fmt.Sprintf("[message[%s/%s]: topic: %s; body.len: %d]", msg.MessageId, msg.MessageType, msg.Topic, len(msg.Body))
