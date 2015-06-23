@@ -231,11 +231,10 @@ func TestDisconnect(t *testing.T) {
 	var c int64 = 0
 	var cc int64
 	readMessage = func(conn net.Conn) (*message, error) {
-		if cc%20 == 0 {
-			cc = atomic.AddInt64(&c, 1)
+		cc = atomic.AddInt64(&c, 1)
+		if cc%500 == 0 {
 			log.Printf("### closing connection %s:%s [%d] ---", conn.RemoteAddr(), conn.LocalAddr(), cc)
 			conn.Close()
-			cc = atomic.AddInt64(&c, 1)
 		}
 		return _readMessage(conn)
 	}
@@ -244,8 +243,8 @@ func TestDisconnect(t *testing.T) {
 	wg := sync.WaitGroup{}
 	wg.Add(2)
 	go func() {
-		for i := 0; i < 100; i++ {
-			cc = atomic.AddInt64(&c, 1)
+		for i := 0; i < 1000; i++ {
+			// cc = atomic.AddInt64(&c, 1)
 			log.Printf("client.1: sending 'Hello1'; cc = %d", cc)
 			reply, _, err := client1.Request("job", []byte("Hello1"))
 			rep := string(reply)
@@ -268,8 +267,8 @@ func TestDisconnect(t *testing.T) {
 	}()
 
 	go func() {
-		for i := 0; i < 100; i++ {
-			cc = atomic.AddInt64(&c, 1)
+		for i := 0; i < 1000; i++ {
+			// cc = atomic.AddInt64(&c, 1)
 			log.Printf("client.2: sending 'Hello2'; cc = %d", cc)
 			reply, _, err := client2.Request("job", []byte("Hello2"))
 			rep := string(reply)
@@ -292,7 +291,7 @@ func TestDisconnect(t *testing.T) {
 	}()
 	wg.Wait()
 	log.Printf("counts: c1s1: %d, c1s2: %d, c2s1: %d, c2s2: %d", c1s1, c1s2, c2s1, c2s2)
-	if c1s1 < 25 || c1s2 < 25 || c2s1 < 25 || c2s2 < 25 || c1s1+c1s2 != 100 || c2s1+c2s2 != 100 {
+	if c1s1 < 25 || c1s2 < 25 || c2s1 < 25 || c2s2 < 25 || c1s1+c1s2 != 1000 || c2s1+c2s2 != 1000 {
 		t.Errorf("Wrong counts")
 	}
 }
@@ -309,14 +308,14 @@ func TestPublish(t *testing.T) {
 	}
 	defer server.Leave()
 	server.Join()
-	server.Subscribe("job", func(topic string, body []byte) []byte {
+	server.Subscribe("job", func(topic string, body []byte, _ MessageId) []byte {
 		log.Printf("published = %s/%s", topic, string(body))
 		server.Publish("result", body)
 		return body
 	})
 
 	client, err := NewMessenger("localhost:40000")
-	client.Subscribe("result", func(topic string, body []byte) []byte {
+	client.Subscribe("result", func(topic string, body []byte, _ MessageId) []byte {
 		log.Printf("client result = %s/%s", topic, string(body))
 		wg.Done()
 		return body
@@ -336,18 +335,18 @@ func TestPublish(t *testing.T) {
 	wg.Wait()
 }
 
-func echo(topic string, body []byte) []byte {
+func echo(topic string, body []byte, _ MessageId) []byte {
 	return body
 }
 
-func echo1(topic string, body []byte) []byte {
+func echo1(topic string, body []byte, _ MessageId) []byte {
 	return []byte("server:1 " + string(body))
 }
 
-func echo2(topic string, body []byte) []byte {
+func echo2(topic string, body []byte, _ MessageId) []byte {
 	return []byte("server:2 " + string(body))
 }
 
-func echo3(topic string, body []byte) []byte {
+func echo3(topic string, body []byte, _ MessageId) []byte {
 	return []byte("server:3 " + string(body))
 }

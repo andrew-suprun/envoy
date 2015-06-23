@@ -18,7 +18,7 @@ func Benchmark1(b *testing.B) {
 	if err != nil {
 		b.FailNow()
 	}
-	server.Subscribe("job", func(topic string, body []byte) []byte {
+	server.Subscribe("job", func(topic string, body []byte, _ MessageId) []byte {
 		// b.Logf("server received topic: '%s' body: '%s'", topic, string(body))
 		return body
 	})

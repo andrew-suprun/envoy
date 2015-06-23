@@ -48,7 +48,7 @@ type MessageId interface {
 	String() string
 }
 
-type Handler func(topic string, body []byte) []byte
+type Handler func(topic string, body []byte, msgId MessageId) []byte
 
 const (
 	publish messageType = iota
@@ -119,20 +119,10 @@ type message struct {
 	Body        []byte      `codec:"b,omitempty"`
 }
 
-type clientMessage struct {
-	client actor.Actor
-	*message
-}
-
 type joinMessage struct {
 	HostId hostId   `codec:"h,omitempty"`
 	Topics []topic  `codec:"t,omitempty"`
 	Peers  []hostId `codec:"p,omitempty"`
-}
-
-type subscribeMessageBody struct {
-	HostId hostId `codec:"id,omitempty"`
-	Topic  topic  `codec:"t,omitempty"`
 }
 
 func NewMessenger(local string) (Messenger, error) {
@@ -452,7 +442,9 @@ func (msgr *messenger) handleNetworkError(_ string, info []interface{}) {
 		msgr.Send("shutdown-peer", peer.peerId)
 
 		if peerId > msgr.hostId {
-			msgr.Send("dial", peerId)
+			time.AfterFunc(time.Millisecond, func() {
+				msgr.Send("dial", peerId)
+			})
 		} else {
 			time.AfterFunc(RedialInterval, func() {
 				msgr.Send("dial", peerId)
@@ -529,11 +521,11 @@ func (msgr *messenger) handleLeaving(peer *peer, msg *message) {
 }
 
 func (msgr *messenger) handleLeft(peer *peer, msg *message) {
-	peer.state = peerStopping
 	if peer == nil {
 		return
 	}
 
+	peer.state = peerStopping
 	pendingFutures := make([]future.Future, len(peer.pendingReplies))
 	for _, pf := range peer.pendingReplies {
 		pendingFutures = append(pendingFutures, pf)
@@ -584,7 +576,7 @@ func (msgr *messenger) runHandlerProtected(msg *message, handler Handler) (resul
 		}
 	}()
 
-	result = handler(string(msg.Topic), msg.Body)
+	result = handler(string(msg.Topic), msg.Body, msg.MessageId)
 	return result, err
 
 }

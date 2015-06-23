@@ -30,6 +30,6 @@ func TestPanic(t *testing.T) {
 	}
 }
 
-func panicingHandler(topic string, body []byte) []byte {
+func panicingHandler(topic string, body []byte, _ MessageId) []byte {
 	panic("foo")
 }
