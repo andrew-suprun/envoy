@@ -3,7 +3,6 @@ package messenger
 import (
 	"bytes"
 	"fmt"
-	"github.com/ugorji/go/codec"
 	"net"
 )
 
@@ -65,15 +64,4 @@ func putUint32(b []byte, v uint32) {
 	b[1] = byte(v >> 8)
 	b[2] = byte(v >> 16)
 	b[3] = byte(v >> 24)
-}
-
-var ch codec.CborHandle
-
-func encode(v interface{}, buf *bytes.Buffer) {
-	codec.NewEncoder(buf, &ch).MustEncode(v)
-}
-
-func decode(buf *bytes.Buffer, v interface{}) {
-	dec := codec.NewDecoder(buf, &ch)
-	dec.MustDecode(v)
 }
