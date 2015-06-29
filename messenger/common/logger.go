@@ -1,13 +1,10 @@
-package messenger
+package common
 
-import "log"
+import (
+	"github.com/andrew-suprun/envoy/messenger"
 
-type Logger interface {
-	Debugf(format string, v ...interface{})
-	Infof(format string, v ...interface{})
-	Errorf(format string, v ...interface{})
-	Panic(err interface{}, stack string)
-}
+	"log"
+)
 
 type defaultLogger struct{}
 
@@ -25,4 +22,8 @@ func (l defaultLogger) Errorf(format string, v ...interface{}) {
 
 func (l defaultLogger) Panic(err interface{}, stack string) {
 	log.Printf("PANIC: %v\nStack:\n%s", err, stack)
+}
+
+func init() {
+	messenger.Log = &defaultLogger{}
 }
