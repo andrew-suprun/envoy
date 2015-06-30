@@ -56,6 +56,7 @@ const (
 	reply
 	replyPanic
 	join
+	dialRequest
 	leaving
 	left
 	subscribe
@@ -692,6 +693,8 @@ func (mType messageType) String() string {
 		return "replyPanic"
 	case join:
 		return "join"
+	case dialRequest:
+		return "dialRequest"
 	case leaving:
 		return "leaving"
 	case subscribe:

@@ -64,15 +64,25 @@ func (lsnr *listener) handleAccept(_ string, _ []interface{}) {
 		return
 	}
 
-	joinMsg, err := lsnr.readJoinInvite(conn)
+	msg, err := readMessage(conn)
 	if err != nil {
-		if !lsnr.stopped {
-			Log.Errorf("Failed to read join invite: err = %v", err)
-		}
+		Log.Errorf("Failed to read join invite: err = %v", err)
 		return
 	}
 
-	lsnr.msgr.Send("accepted", conn, joinMsg)
+	buf := bytes.NewBuffer(msg.Body)
+
+	switch msg.MessageType {
+	case join:
+		var joinMsg joinMessage
+		decode(buf, &joinMsg)
+		lsnr.msgr.Send("accepted", conn, joinMsg)
+	case dialRequest:
+		var remote hostId
+		decode(buf, &remote)
+		lsnr.msgr.Send("dial-requested", remote)
+		conn.Close()
+	}
 }
 
 func (lsnr *listener) readJoinInvite(conn net.Conn) (*joinMessage, error) {
