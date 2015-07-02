@@ -1,6 +1,7 @@
 package messenger
 
 import (
+	. "github.com/andrew-suprun/envoy"
 	"log"
 	"runtime"
 	"sync/atomic"

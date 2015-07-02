@@ -64,18 +64,13 @@ func (a *actor) run() {
 		msg := a.pending[0]
 		a.pending = a.pending[1:]
 
-		if msg.messageType == "stop" {
-			a.Stop()
-			return
-		}
-
 		h, found := a.handlers[msg.messageType]
 
 		a.Cond.L.Unlock()
 
 		if found {
 			h(msg.messageType, msg.params)
-		} else if msg.messageType != "stop" {
+		} else {
 			panic(fmt.Sprintf("Actor %s received unsupported message type: %s", a.name, msg.messageType))
 		}
 	}
@@ -91,13 +86,6 @@ func (a *actor) Send(msgType string, info ...interface{}) {
 func (a *actor) Stop() {
 	a.Cond.L.Lock()
 	a.running = false
-	h, found := a.handlers["stop"]
-	if found {
-		a.Cond.L.Unlock()
-		h("stop", nil)
-		a.Cond.L.Lock()
-	}
-
 	a.Cond.Signal()
 	a.Cond.L.Unlock()
 }

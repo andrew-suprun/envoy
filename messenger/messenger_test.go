@@ -2,6 +2,8 @@ package messenger
 
 import (
 	"errors"
+	. "github.com/andrew-suprun/envoy"
+	"github.com/andrew-suprun/envoy/messenger/common"
 	"log"
 	"net"
 	"sync"
@@ -19,8 +21,8 @@ func TestOneOnOne(t *testing.T) {
 	if err != nil {
 		t.FailNow()
 	}
-	defer server.Leave()
 	server.Join("localhost:20000")
+	defer server.Leave()
 	server.Subscribe("job", echo)
 
 	client, err := NewMessenger("localhost:40000")
@@ -230,13 +232,23 @@ func TestDisconnect(t *testing.T) {
 
 	var c int64 = 0
 	var cc int64
-	readMessage = func(conn net.Conn) (*message, error) {
+	readMessage := common.ReadMessage
+	common.ReadMessage = func(conn net.Conn) (*common.Message, error) {
 		cc = atomic.AddInt64(&c, 1)
 		if cc%500 == 0 {
 			log.Printf("### closing connection %s:%s [%d] ---", conn.RemoteAddr(), conn.LocalAddr(), cc)
 			conn.Close()
 		}
-		return _readMessage(conn)
+		return readMessage(conn)
+	}
+	writeMessage := common.WriteMessage
+	common.WriteMessage = func(conn net.Conn, msg *common.Message) error {
+		cc = atomic.AddInt64(&c, 1)
+		if cc%500 == 250 {
+			log.Printf("### closing connection %s:%s [%d] ---", conn.RemoteAddr(), conn.LocalAddr(), cc)
+			conn.Close()
+		}
+		return writeMessage(conn, msg)
 	}
 
 	c1s1, c1s2, c2s1, c2s2 := 0, 0, 0, 0
