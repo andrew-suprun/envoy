@@ -7,7 +7,6 @@ import (
 	"github.com/andrew-suprun/envoy/actor"
 	"github.com/andrew-suprun/envoy/future"
 	. "github.com/andrew-suprun/envoy/messenger/common"
-	"github.com/andrew-suprun/envoy/messenger/dialer"
 	"github.com/andrew-suprun/envoy/messenger/listener"
 	"github.com/andrew-suprun/envoy/messenger/reader"
 	"github.com/andrew-suprun/envoy/messenger/writer"
@@ -41,7 +40,6 @@ type peers struct {
 	hostId        HostId
 	subscriptions map[Topic]Handler
 	peers         map[HostId]*peer
-	connecting    map[HostId]struct{}
 	listener      Sender
 	dialer        Sender
 	netListener   net.Listener
@@ -84,7 +82,6 @@ func NewPeers(local string) (Sender, error) {
 		hostId:        hostId,
 		subscriptions: make(map[Topic]Handler),
 		peers:         make(map[HostId]*peer),
-		connecting:    make(map[HostId]struct{}),
 	}
 	peers.Actor = actor.NewActor(local+"-peers").
 		RegisterHandler("join", peers.handleJoin).
@@ -98,12 +95,12 @@ func NewPeers(local string) (Sender, error) {
 		RegisterHandler("dial", peers.handleDial).
 		RegisterHandler("dialed", peers.handleConnected).
 		RegisterHandler("accepted", peers.handleConnected).
-		RegisterHandler("dial-error", peers.handleDialError).
 		RegisterHandler("timeout", peers.handleTimeout).
 		RegisterHandler("message", peers.handleMessage).
 		RegisterHandler("listening", peers.handleListening).
 		RegisterHandler("network-error", peers.handleNetworkError).
 		RegisterHandler("write-result", peers.handleWriteResult).
+		RegisterHandler("dial-ticker", peers.handleDialTicker).
 
 		// RegisterHandler("send-message", peers.handleSendMessage).
 		// RegisterHandler("broadcast-message", peers.handleBroadcastMessage).
@@ -115,31 +112,154 @@ func NewPeers(local string) (Sender, error) {
 
 func (ps *peers) handleJoin(_ string, info []interface{}) {
 	remotes, _ := info[0].([]string)
-	joinResult, _ := info[1].(future.Future)
-	ps.joinResult = joinResult
-
-	ps.dialer = dialer.NewDialer(ps.hostId, ps)
+	ps.joinResult = info[1].(future.Future)
 
 	var err error
 	ps.listener, err = listener.NewListener(ps.hostId, ps, ps.newJoinMessage())
 	if err != nil {
-		joinResult.SetError(err)
-		ps.Send("leave", joinResult)
+		ps.joinResult.SetError(err)
+		ps.Send("leave", ps.joinResult)
 	}
 
-	var havePeers = false
 	for _, remote := range remotes {
 		remoteAddr, err := resolveAddr(remote)
 		if err == nil {
-			ps.Send("dial", remoteAddr)
-			havePeers = true
+			ps.peers[remoteAddr] = newPeer(remoteAddr)
 		} else {
 			Log.Errorf("Cannot resolve address %s. Ignoring.", remote)
 		}
 	}
-	if !havePeers {
-		joinResult.SetValue(false)
+	ps.Send("dial-ticker")
+}
+
+func newPeer(peerId HostId) *peer {
+	return &peer{
+		peerId:         peerId,
+		topics:         make(map[Topic]struct{}),
+		pendingReplies: make(map[MsgId]*pendingReply),
+		state:          pendingDial,
 	}
+}
+
+func (ps *peers) handleDialTicker(_ string, _ []interface{}) {
+	if ps.leaveFuture != nil {
+		return
+	}
+	ps.Send("dial")
+	time.Sleep(RedialInterval)
+	ps.Send("dial-ticker")
+}
+
+func (ps *peers) handleDial(_ string, info []interface{}) {
+	for _, peer := range ps.peers {
+		if peer.state == pendingDial || peer.state == pendingRedial {
+			if ps.hostId < peer.peerId {
+				go dial(peer.peerId, ps.newJoinMessage(), ps)
+			} else {
+				go requestDial(peer.peerId, ps)
+			}
+		}
+	}
+}
+
+func dial(hostId HostId, joinMsg *JoinMessage, recipient Sender) {
+	conn, err := net.Dial("tcp", string(hostId))
+	if err != nil {
+		Log.Errorf("Failed to dial %s: %v. Will re-dial.", hostId, err)
+		return
+	}
+
+	buf := &bytes.Buffer{}
+	Encode(joinMsg, buf)
+	msg := &Message{
+		MessageType: Join,
+		Body:        buf.Bytes(),
+	}
+	err = WriteMessage(conn, msg)
+	if err != nil {
+		conn.Close()
+		Log.Errorf("Failed to dial %s: %v. Will re-dial.", hostId, err)
+		return
+	}
+
+	replyMsg, err := ReadMessage(conn)
+	if err != nil {
+		conn.Close()
+		Log.Errorf("Failed to dial %s: %v. Will re-dial.", hostId, err)
+		return
+	}
+
+	buf = bytes.NewBuffer(replyMsg.Body)
+	reply := &JoinMessage{}
+	Decode(buf, reply)
+
+	recipient.Send("dialed", conn, reply)
+}
+
+func requestDial(hostId HostId, recepient Sender) {
+	conn, err := net.Dial("tcp", string(hostId))
+	if err != nil {
+		Log.Errorf("Failed to dial %s: %v. Will re-dial.", hostId, err)
+		return
+	}
+
+	buf := &bytes.Buffer{}
+	Encode(hostId, buf)
+	reqDial := &Message{
+		MessageType: RequestDial,
+		Body:        buf.Bytes(),
+	}
+	err = WriteMessage(conn, reqDial)
+	conn.Close()
+	if err != nil {
+		Log.Errorf("Failed to dial %s: %v. Will re-dial.", hostId, err)
+	}
+}
+
+func (ps *peers) handleConnected(msgType string, info []interface{}) {
+	conn := info[0].(net.Conn)
+	reply := info[1].(*JoinMessage)
+
+	peer := ps.peers[reply.HostId]
+	if peer == nil {
+		Log.Errorf("Connected from unknown peer %s. Ignoring.", reply.HostId)
+		return
+	}
+
+	ps.setConn(peer, conn, reply.Topics)
+
+	if msgType == "accepted" {
+		buf := &bytes.Buffer{}
+		Encode(ps.newJoinMessage(), buf)
+		msg := &Message{
+			MessageId:   NewId(),
+			MessageType: join,
+			Body:        buf.Bytes(),
+		}
+
+		err := WriteMessage(conn, msg)
+		if err != nil {
+			ps.Send("network-error", peer.peerId, err)
+			return
+		}
+	}
+
+	Log.Infof("Peer %s joined. (%s)", peer.peerId, msgType)
+
+	for _, peerId := range reply.Peers {
+		if _, found := ps.peers[peerId]; !found {
+			ps.peers[peerId] = newPeer(peerId)
+		}
+	}
+	if ps.joinResult != nil {
+		for _, peer := range ps.peers {
+			if peer.state == pendingDial {
+				return
+			}
+		}
+	}
+	ps.joinResult.SetValue(true)
+	ps.joinResult = nil
 }
 
 func (ps *peers) handleLeave(_ string, info []interface{}) {
@@ -154,9 +274,6 @@ func (ps *peers) handleLeave(_ string, info []interface{}) {
 	}
 	if ps.netListener != nil {
 		ps.netListener.Close()
-	}
-	if ps.dialer != nil {
-		ps.dialer.Send("leave")
 	}
 	if len(ps.peers) == 0 {
 		ps.leaveFuture.SetValue(true)
@@ -242,23 +359,6 @@ func (ps *peers) sendMessageToServer(server *peer, msg *Message, reply future.Fu
 	server.writer.Send("write", msg)
 }
 
-func (ps *peers) handleDial(_ string, info []interface{}) {
-	hostId := info[0].(HostId)
-	ps.logf("handleDial.01: dialing %s: %v", hostId, ps.connecting)
-
-	_, connecting := ps.connecting[hostId]
-	if connecting || ps.hostId == hostId || ps.peers[hostId] != nil {
-		return
-	}
-
-	ps.logf("handleDial.02: dialing %s: %v", hostId, ps.connecting)
-	ps.connecting[hostId] = struct{}{}
-	ps.logf("handleDial.03: dialing %s: %v", hostId, ps.connecting)
-	ps.dialer.Send("dial", hostId, ps.newJoinMessage())
-	time.AfterFunc(RedialInterval, func() { ps.Send("dial", hostId) })
-	ps.logf("handleDial.04: dialing %s: %v", hostId, ps.connecting)
-}
-
 func (ps *peers) handleTimeout(_ string, info []interface{}) {
 	peerId := info[0].(HostId)
 	msgId := info[1].(MsgId)
@@ -325,61 +425,6 @@ func (ps *peers) broadcastMessageAsync(topic Topic, body []byte, msgType MsgType
 	}
 }
 
-func (ps *peers) handleConnected(msgType string, info []interface{}) {
-	conn := info[0].(net.Conn)
-	reply := info[1].(*JoinMessage)
-
-	delete(ps.connecting, reply.HostId)
-	ps.logf("--- connecting.3 del %s: %v [%v]", reply.HostId, ps.connecting, reply.Topics)
-	if ps.joinResult != nil && len(ps.connecting) == 0 {
-		ps.joinResult.SetValue(true)
-	}
-
-	peer := ps.newPeer(reply.HostId)
-	ps.peers[reply.HostId] = peer
-	ps.setConn(peer, conn, reply.Topics)
-
-	if msgType == "accepted" {
-		buf := &bytes.Buffer{}
-		Encode(ps.newJoinMessage(), buf)
-		msg := &Message{
-			MessageId:   NewId(),
-			MessageType: join,
-			Body:        buf.Bytes(),
-		}
-
-		err := WriteMessage(conn, msg)
-		if err != nil {
-			ps.Send("network-error", peer.peerId, err)
-			return
-		}
-	}
-
-	peer.state = connected
-	Log.Infof("Peer %s joined. (%s)", peer.peerId, msgType)
-
-	for _, peerId := range reply.Peers {
-		if _, found := ps.peers[peerId]; !found {
-			ps.Send("dial", peerId)
-		}
-	}
-}
-
-func (ps *peers) handleDialError(msgType string, info []interface{}) {
-	peerId := info[0].(HostId)
-	ps.logf("dial %s: %s", peerId, msgType)
-
-	if msgType == "dial-error" {
-		Log.Errorf("Failed to dial %s: %v. Will re-dial.", peerId, info[1].(error))
-	}
-
-	delete(ps.connecting, peerId)
-	ps.logf("--- connecting.2 del %s: %v", peerId, ps.connecting)
-	if ps.joinResult != nil && len(ps.connecting) == 0 {
-		ps.joinResult.SetValue(true)
-	}
-}
-
 func (ps *peers) handleShutdownPeer(_ string, info []interface{}) {
 	peerId := info[0].(HostId)
 	peer := ps.peers[peerId]
@@ -404,15 +449,6 @@ func (ps *peers) handleShutdownPeer(_ string, info []interface{}) {
 	ps.Send("shutdown-peers")
 }
 
-func (ps *peers) newPeer(hostId HostId) *peer {
-	peer := &peer{
-		peerId:         hostId,
-		topics:         make(map[Topic]struct{}),
-		pendingReplies: make(map[MsgId]*pendingReply),
-	}
-	return peer
-}
-
 func (ps *peers) setConn(peer *peer, conn net.Conn, topics []Topic) {
 	peer.conn = conn
 	peer.reader = reader.NewReader(fmt.Sprintf("%s-%s-reader", ps.hostId, peer.peerId), peer.peerId, peer.conn, ps)
@@ -420,6 +456,7 @@ func (ps *peers) setConn(peer *peer, conn net.Conn, topics []Topic) {
 	for _, t := range topics {
 		peer.topics[t] = struct{}{}
 	}
+	peer.state = connected
 }
 
 func (ps *peers) handleListening(_ string, info []interface{}) {
