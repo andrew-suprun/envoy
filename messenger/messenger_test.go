@@ -1,8 +1,8 @@
-package impl
+package messenger
 
 import (
 	"errors"
-	. "github.com/andrew-suprun/envoy/messenger"
+	. "github.com/andrew-suprun/envoy"
 	"log"
 	"sync"
 	"testing"
@@ -14,20 +14,19 @@ var testError = errors.New("test error")
 func TestOneOnOne(t *testing.T) {
 	log.Println("---------------- TestOneOnOne ----------------")
 
-	server := NewMessenger("localhost:50000")
-	defer server.Leave()
-	err := server.Join("localhost:20000")
+	server, err := NewMessenger("localhost:50000")
 	if err != nil {
 		log.Fatalf("Failed to join: %v", err)
 	}
+	server.Join("localhost:20000")
 	defer server.Leave()
 	server.Subscribe("job", echo)
 
-	client := NewMessenger("localhost:40000")
-	err = client.Join("localhost:50000")
+	client, err := NewMessenger("localhost:40000")
 	if err != nil {
 		log.Fatalf("Failed to join: %v", err)
 	}
+	client.Join("localhost:50000")
 	defer client.Leave()
 
 	for i := 0; i < 20; i++ {
@@ -46,36 +45,36 @@ func TestOneOnThree(t *testing.T) {
 
 	Timeout = time.Duration(5 * time.Second)
 
-	server1 := NewMessenger("localhost:50001")
-	defer server1.Leave()
-	err := server1.Join()
+	server1, err := NewMessenger("localhost:50001")
 	if err != nil {
 		log.Fatalf("Failed to join: %v", err)
 	}
+	server1.Join()
+	defer server1.Leave()
 	server1.Subscribe("job", echo1)
 
-	server2 := NewMessenger("localhost:50002")
-	defer server2.Leave()
+	server2, err := NewMessenger("localhost:50002")
+	if err != nil {
+		log.Fatalf("Failed to join: %v", err)
+	}
 	server2.Subscribe("job", echo2)
-	err = server2.Join("localhost:50001")
-	if err != nil {
-		log.Fatalf("Failed to join: %v", err)
-	}
+	server2.Join("localhost:50001")
+	defer server2.Leave()
 
-	server3 := NewMessenger("localhost:50003")
-	defer server3.Leave()
-	err = server3.Join("localhost:50002")
+	server3, err := NewMessenger("localhost:50003")
 	if err != nil {
 		log.Fatalf("Failed to join: %v", err)
 	}
+	server3.Join("localhost:50002")
+	defer server3.Leave()
 	server3.Subscribe("job", echo3)
 
-	client := NewMessenger("localhost:40000")
-	defer client.Leave()
-	err = client.Join("localhost:50002")
+	client, err := NewMessenger("localhost:40000")
 	if err != nil {
 		log.Fatalf("Failed to join: %v", err)
 	}
+	client.Join("localhost:50002")
+	defer client.Leave()
 
 	s1, s2, s3 := 0, 0, 0
 	for i := 0; i < 100; i++ {
@@ -107,35 +106,35 @@ func TestOneOnThree(t *testing.T) {
 func TestTwoOnTwo(t *testing.T) {
 	log.Println("---------------- TestTwoOnTwo ----------------")
 
-	server1 := NewMessenger("localhost:50000")
-	defer server1.Leave()
+	server1, err := NewMessenger("localhost:50000")
+	if err != nil {
+		log.Fatalf("Failed to join: %v", err)
+	}
 	server1.Subscribe("job", echo1)
-	err := server1.Join()
+	server1.Join()
+	defer server1.Leave()
+
+	server2, err := NewMessenger("localhost:50001")
 	if err != nil {
 		log.Fatalf("Failed to join: %v", err)
 	}
-
-	server2 := NewMessenger("localhost:50001")
-	defer server2.Leave()
 	server2.Subscribe("job", echo2)
-	err = server2.Join("localhost:50000")
+	server2.Join("localhost:50000")
+	defer server2.Leave()
+
+	client1, err := NewMessenger("localhost:40000")
 	if err != nil {
 		log.Fatalf("Failed to join: %v", err)
 	}
-
-	client1 := NewMessenger("localhost:40000")
+	client1.Join("localhost:50000")
 	defer client1.Leave()
-	err = client1.Join("localhost:50000")
-	if err != nil {
-		log.Fatalf("Failed to join: %v", err)
-	}
 
-	client2 := NewMessenger("localhost:40001")
-	defer client2.Leave()
-	err = client2.Join("localhost:50000")
+	client2, err := NewMessenger("localhost:40001")
 	if err != nil {
 		log.Fatalf("Failed to join: %v", err)
 	}
+	client2.Join("localhost:50000")
+	defer client2.Leave()
 
 	c1s1, c1s2, c2s1, c2s2 := 0, 0, 0, 0
 	wg := sync.WaitGroup{}
@@ -195,35 +194,35 @@ func TestDisconnect(t *testing.T) {
 
 	Timeout = 2 * time.Second
 
-	server1 := NewMessenger("localhost:50000")
-	defer server1.Leave()
+	server1, err := NewMessenger("localhost:50000")
+	if err != nil {
+		log.Fatalf("Failed to join: %v", err)
+	}
 	server1.Subscribe("job", echo1)
-	err := server1.Join()
+	server1.Join()
+	defer server1.Leave()
+
+	server2, err := NewMessenger("localhost:50001")
 	if err != nil {
 		log.Fatalf("Failed to join: %v", err)
 	}
-
-	server2 := NewMessenger("localhost:50001")
-	defer server2.Leave()
 	server2.Subscribe("job", echo2)
-	err = server2.Join("localhost:50000")
+	server2.Join("localhost:50000")
+	defer server2.Leave()
+
+	client1, err := NewMessenger("localhost:40000")
 	if err != nil {
 		log.Fatalf("Failed to join: %v", err)
 	}
-
-	client1 := NewMessenger("localhost:40000")
+	client1.Join("localhost:50000")
 	defer client1.Leave()
-	err = client1.Join("localhost:50000")
-	if err != nil {
-		log.Fatalf("Failed to join: %v", err)
-	}
 
-	client2 := NewMessenger("localhost:40001")
-	defer client2.Leave()
-	err = client2.Join("localhost:50000")
+	client2, err := NewMessenger("localhost:40001")
 	if err != nil {
 		log.Fatalf("Failed to join: %v", err)
 	}
+	client2.Join("localhost:50000")
+	defer client2.Leave()
 
 	// TODO
 	// var c int64 = 0
@@ -300,11 +299,11 @@ func TestPublish(t *testing.T) {
 	wg := sync.WaitGroup{}
 	wg.Add(20)
 
-	server := NewMessenger("localhost:50000")
-	err := server.Join()
+	server, err := NewMessenger("localhost:50000")
 	if err != nil {
 		t.FailNow()
 	}
+	server.Join()
 	defer server.Leave()
 	server.Subscribe("job", func(topic string, body []byte, _ MessageId) []byte {
 		log.Printf("published = %s/%s", topic, string(body))
@@ -312,16 +311,16 @@ func TestPublish(t *testing.T) {
 		return body
 	})
 
-	client := NewMessenger("localhost:40000")
+	client, err := NewMessenger("localhost:40000")
+	if err != nil {
+		t.FailNow()
+	}
 	client.Subscribe("result", func(topic string, body []byte, _ MessageId) []byte {
 		log.Printf("client result = %s/%s", topic, string(body))
 		wg.Done()
 		return body
 	})
-	err = client.Join("localhost:50000")
-	if err != nil {
-		t.FailNow()
-	}
+	client.Join("localhost:50000")
 	defer client.Leave()
 
 	for i := 0; i < 20; i++ {

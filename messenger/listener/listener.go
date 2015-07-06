@@ -1,31 +1,32 @@
 package listener
 
 import (
+	. "github.com/andrew-suprun/envoy"
 	"github.com/andrew-suprun/envoy/actor"
-	. "github.com/andrew-suprun/envoy/messenger"
 	. "github.com/andrew-suprun/envoy/messenger/common"
 	"log"
 	"net"
 )
 
+type (
+	MsgConnAccepted struct{ net.Conn }
+	MsgAcceptFailed struct{}
+)
+
 type listener struct {
-	actor.Actor
+	self      actor.Actor
 	hostId    HostId
 	listener  net.Listener
-	recipient Sender
+	recipient actor.Actor
 	stopped   bool
 }
 
-func NewListener(hostId HostId, recipient Sender) (Sender, error) {
+func NewListener(hostId HostId, recipient actor.Actor) (actor.Actor, error) {
 	lsnr := &listener{
-		Actor:     actor.NewActor("listener-" + string(hostId)),
 		hostId:    hostId,
 		recipient: recipient,
 	}
-	lsnr.
-		RegisterHandler("accept", lsnr.handleAccept).
-		RegisterHandler("stop", lsnr.handleStop).
-		Start()
+	lsnr.self = actor.NewActor(lsnr)
 
 	var err error
 	lsnr.listener, err = net.Listen("tcp", string(hostId))
@@ -34,31 +35,17 @@ func NewListener(hostId HostId, recipient Sender) (Sender, error) {
 		return nil, err
 	}
 	Log.Infof("Listening on: %s", hostId)
-	lsnr.Send("accept")
-	return lsnr, nil
+	lsnr.self.Send(nil)
+	return lsnr.self, nil
 }
 
-func (lsnr *listener) handleStop(_ string, _ []interface{}) {
-	lsnr.stopped = true
-	lsnr.listener.Close()
-}
-
-func (lsnr *listener) handleAccept(_ string, _ []interface{}) {
-	defer func() {
-		if !lsnr.stopped {
-			lsnr.Send("accept")
-		}
-	}()
-
+func (lsnr *listener) Handle(_ interface{}) {
 	conn, err := lsnr.listener.Accept()
 	if err != nil {
-		if !lsnr.stopped {
-			Log.Errorf("Failed to accept connection: err = %v", err)
-		}
+		lsnr.recipient.Send(MsgAcceptFailed{})
 		return
 	}
-
-	lsnr.recipient.Send("accepted", conn)
+	lsnr.recipient.Send(MsgConnAccepted{conn})
 }
 
 func (lsnr *listener) String() string {

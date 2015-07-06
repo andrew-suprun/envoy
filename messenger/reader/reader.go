@@ -2,47 +2,47 @@ package reader
 
 import (
 	"bytes"
+	. "github.com/andrew-suprun/envoy"
 	"github.com/andrew-suprun/envoy/actor"
-	. "github.com/andrew-suprun/envoy/messenger"
 	. "github.com/andrew-suprun/envoy/messenger/common"
 	"net"
 )
 
+type (
+	MsgMessageRead struct {
+		HostId HostId
+		Msg    *Message
+	}
+)
+
 type reader struct {
-	actor.Actor
-	name      string
 	hostId    HostId
 	conn      net.Conn
-	recipient Sender
+	self      actor.Actor
+	recipient actor.Actor
 }
 
-func NewReader(name string, hostId HostId, conn net.Conn, recipient Sender) Sender {
+func NewReader(hostId HostId, conn net.Conn, recipient actor.Actor) actor.Actor {
 	reader := &reader{
-		name:      name,
 		hostId:    hostId,
-		Actor:     actor.NewActor(name),
 		conn:      conn,
 		recipient: recipient,
 	}
-
-	reader.
-		RegisterHandler("read-message", reader.handleReadMessage).
-		Start().
-		Send("read-message")
-	return reader
+	reader.self = actor.NewActor(reader)
+	reader.self.Send(nil)
+	return reader.self
 }
 
-func (reader *reader) handleReadMessage(_ string, _ []interface{}) {
-	msg, err := readMessage(reader.conn)
+func (r *reader) Handle(_ interface{}) {
+	msg, err := readMessage(r.conn)
 	if err != nil {
-		reader.recipient.Send("network-error", reader.hostId, err)
+		r.recipient.Send(MsgNetworkError{r.hostId, err})
 	} else {
-		reader.recipient.Send("message", reader.hostId, msg)
-		reader.Send("read-message")
+		r.recipient.Send(MsgMessageRead{r.hostId, msg})
+		r.self.Send(nil)
 	}
 }
 
-// todo: add timeout handling
 func readMessage(from net.Conn) (*Message, error) {
 	if from == nil {
 		return nil, NilConnError
@@ -75,5 +75,5 @@ func readMessage(from net.Conn) (*Message, error) {
 }
 
 func (reader *reader) logf(format string, params ...interface{}) {
-	Log.Debugf(">>> %s: "+format, append([]interface{}{reader.name}, params...)...)
+	Log.Debugf(">>> reader-%s-%s: "+format, append([]interface{}{reader.conn.LocalAddr(), reader.conn.RemoteAddr()}, params...)...)
 }

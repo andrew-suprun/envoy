@@ -1,7 +1,7 @@
 package common
 
 import (
-	"github.com/andrew-suprun/envoy/messenger"
+	"github.com/andrew-suprun/envoy"
 
 	"log"
 )
@@ -25,5 +25,5 @@ func (l defaultLogger) Panic(err interface{}, stack string) {
 }
 
 func init() {
-	messenger.Log = &defaultLogger{}
+	envoy.Log = &defaultLogger{}
 }

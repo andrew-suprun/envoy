@@ -1,7 +1,7 @@
-package impl
+package messenger
 
 import (
-	. "github.com/andrew-suprun/envoy/messenger"
+	. "github.com/andrew-suprun/envoy"
 	"log"
 	"testing"
 )
@@ -9,19 +9,19 @@ import (
 func TestPanic(t *testing.T) {
 	log.Println("---------------- TestPanic ----------------")
 
-	server := NewMessenger("localhost:50000")
-	server.Subscribe("job", panicingHandler)
-	err := server.Join()
+	server, err := NewMessenger("localhost:50000")
 	if err != nil {
 		t.FailNow()
 	}
+	server.Subscribe("job", panicingHandler)
+	server.Join()
 	defer server.Leave()
 
-	client := NewMessenger("localhost:40000")
-	err = client.Join("localhost:50000")
+	client, err := NewMessenger("localhost:40000")
 	if err != nil {
 		t.FailNow()
 	}
+	client.Join("localhost:50000")
 	defer client.Leave()
 
 	reply, _, err := client.Request("job", []byte("Hello"))

@@ -7,9 +7,7 @@ import (
 
 type Future interface {
 	Value() interface{}
-	Error() error
 	SetValue(value interface{})
-	SetError(err error)
 }
 
 func NewFuture() Future {
@@ -20,7 +18,6 @@ func NewFuture() Future {
 
 type future struct {
 	value interface{}
-	err   error
 	cond  *sync.Cond
 	set   bool
 }
@@ -37,32 +34,10 @@ func (f *future) Value() interface{} {
 	}
 }
 
-func (f *future) Error() error {
-	for {
-		f.cond.L.Lock()
-		if f.set {
-			f.cond.L.Unlock()
-			return f.err
-		}
-		f.cond.Wait()
-		f.cond.L.Unlock()
-	}
-}
-
 func (f *future) SetValue(value interface{}) {
 	f.cond.L.Lock()
 	if !f.set {
 		f.value = value
-		f.set = true
-		f.cond.Broadcast()
-	}
-	f.cond.L.Unlock()
-}
-
-func (f *future) SetError(err error) {
-	f.cond.L.Lock()
-	if !f.set {
-		f.err = err
 		f.set = true
 		f.cond.Broadcast()
 	}
@@ -74,9 +49,7 @@ func (f *future) String() string {
 	defer f.cond.L.Unlock()
 	if !f.set {
 		return "[future: pending]"
-	} else if f.err != nil {
-		return fmt.Sprintf("[future: error=%+v]", f.err)
 	} else {
-		return fmt.Sprintf("[future: value=%+v]", f.value)
+		return fmt.Sprintf("[future: value [%T] = %+v]", f.value, f.value)
 	}
 }

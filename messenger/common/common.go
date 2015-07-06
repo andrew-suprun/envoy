@@ -5,12 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"github.com/andrew-suprun/envoy/future"
 	"github.com/ugorji/go/codec"
 )
-
-type Sender interface {
-	Send(messageType string, params ...interface{})
-}
 
 type (
 	Topic   string
@@ -23,6 +20,8 @@ const (
 	Publish MsgType = iota
 	Request
 	Reply
+	Broadcast
+	Survey
 	ReplyTimeout
 	ReplyPanic
 	Join
@@ -34,6 +33,15 @@ const (
 
 const (
 	messageIdSize = 16
+)
+
+type (
+	MsgNetworkError struct {
+		HostId HostId
+		Err    error
+	}
+	MsgAddHost struct{ HostId }
+	MsgLeave   struct{ Result future.Future }
 )
 
 type Message struct {

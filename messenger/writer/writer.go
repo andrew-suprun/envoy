@@ -3,39 +3,40 @@ package writer
 import (
 	"bytes"
 	"fmt"
+	. "github.com/andrew-suprun/envoy"
 	"github.com/andrew-suprun/envoy/actor"
-	. "github.com/andrew-suprun/envoy/messenger"
 	. "github.com/andrew-suprun/envoy/messenger/common"
 	"net"
 )
 
+type (
+	MsgMessageWritten struct {
+		HostId HostId
+		MsgId  MsgId
+	}
+)
+
 type writer struct {
-	actor.Actor
-	name      string
 	hostId    HostId
 	conn      net.Conn
-	recipient Sender
+	recipient actor.Actor
 }
 
-func NewWriter(name string, hostId HostId, conn net.Conn, recipient Sender) Sender {
-	writer := &writer{
-		name:      name,
+func NewWriter(hostId HostId, conn net.Conn, recipient actor.Actor) actor.Actor {
+	return actor.NewActor(&writer{
 		hostId:    hostId,
-		Actor:     actor.NewActor(name),
 		conn:      conn,
 		recipient: recipient,
-	}
-
-	return writer.
-		RegisterHandler("write", writer.handleWrite).
-		Start()
+	})
 }
 
-func (writer *writer) handleWrite(_ string, info []interface{}) {
-	msg := info[0].(*Message)
-	err := writeMessage(writer.conn, msg)
+func (writer *writer) Handle(msg interface{}) {
+	message := msg.(*Message)
+	err := writeMessage(writer.conn, message)
 	if err != nil {
-		writer.recipient.Send("write-error", writer.hostId, err)
+		writer.recipient.Send(MsgNetworkError{writer.hostId, err})
+	} else {
+		writer.recipient.Send(MsgMessageWritten{writer.hostId, message.MessageId})
 	}
 }
 
@@ -52,5 +53,5 @@ func writeMessage(to net.Conn, msg *Message) error {
 }
 
 func (writer *writer) logf(format string, params ...interface{}) {
-	Log.Debugf(">>> %s: "+format, append([]interface{}{writer.name}, params...)...)
+	Log.Debugf(">>> writer-%s-%s: "+format, append([]interface{}{writer.conn.LocalAddr(), writer.conn.RemoteAddr()}, params...)...)
 }

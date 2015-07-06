@@ -1,7 +1,7 @@
-package impl
+package messenger
 
 import (
-	. "github.com/andrew-suprun/envoy/messenger"
+	. "github.com/andrew-suprun/envoy"
 	"log"
 	"runtime"
 	"sync/atomic"
@@ -15,23 +15,23 @@ func Benchmark1(b *testing.B) {
 		log.Println("count", c)
 	}()
 
-	server := NewMessenger("localhost:55555")
+	server, err := NewMessenger("localhost:55555")
+	if err != nil {
+		b.Fatalf("Failed to join: %v", err)
+	}
 	server.Subscribe("job", func(topic string, body []byte, _ MessageId) []byte {
 		// b.Logf("server received topic: '%s' body: '%s'", topic, string(body))
 		return body
 	})
-	err := server.Join()
-	if err != nil {
-		b.Fatalf("Failed to join: %v", err)
-	}
+	server.Join()
 	defer server.Leave()
 
-	client := NewMessenger("localhost:44444")
-
-	err = client.Join("localhost:55555")
+	client, err := NewMessenger("localhost:44444")
 	if err != nil {
 		b.Fatalf("Failed to join: %v", err)
 	}
+
+	client.Join("localhost:55555")
 	defer client.Leave()
 
 	body := []byte("hello")
