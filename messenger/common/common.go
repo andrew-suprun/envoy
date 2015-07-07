@@ -52,7 +52,6 @@ type Message struct {
 }
 
 type JoinMessage struct {
-	HostId HostId   `codec:"h,omitempty"`
 	Topics []Topic  `codec:"t,omitempty"`
 	Peers  []HostId `codec:"p,omitempty"`
 }

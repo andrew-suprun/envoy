@@ -4,6 +4,7 @@ import (
 	. "github.com/andrew-suprun/envoy"
 	"github.com/andrew-suprun/envoy/actor"
 	. "github.com/andrew-suprun/envoy/messenger/common"
+	"github.com/andrew-suprun/envoy/messenger/proxy"
 	"log"
 	"net"
 )
@@ -21,7 +22,7 @@ type listener struct {
 	stopped   bool
 }
 
-func NewListener(hostId HostId, recipient actor.Actor) (actor.Actor, error) {
+func NewListener(hostId HostId, recipient actor.Actor, _net proxy.Network) (actor.Actor, error) {
 	lsnr := &listener{
 		hostId:    hostId,
 		recipient: recipient,
@@ -29,7 +30,7 @@ func NewListener(hostId HostId, recipient actor.Actor) (actor.Actor, error) {
 	lsnr.self = actor.NewActor(lsnr)
 
 	var err error
-	lsnr.listener, err = net.Listen("tcp", string(hostId))
+	lsnr.listener, err = _net.Listen(hostId)
 	if err != nil {
 		Log.Errorf("Failed to listen on %s. Exiting.", hostId)
 		return nil, err

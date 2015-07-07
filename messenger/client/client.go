@@ -7,6 +7,7 @@ import (
 	"github.com/andrew-suprun/envoy/actor"
 	"github.com/andrew-suprun/envoy/future"
 	. "github.com/andrew-suprun/envoy/messenger/common"
+	"github.com/andrew-suprun/envoy/messenger/proxy"
 	"github.com/andrew-suprun/envoy/messenger/reader"
 	"github.com/andrew-suprun/envoy/messenger/writer"
 	"math/rand"
@@ -17,8 +18,8 @@ import (
 type client struct {
 	self        actor.Actor
 	clientId    HostId
+	proxy       proxy.Network
 	servers     map[HostId]*server
-	dialer      actor.Actor
 	dialResult  future.Future
 	leaveFuture future.Future
 }
@@ -69,9 +70,10 @@ type (
 	}
 )
 
-func NewClent(clientId HostId) actor.Actor {
+func NewClent(clientId HostId, _net proxy.Network) actor.Actor {
 	c := &client{
 		clientId: clientId,
+		proxy:    _net,
 		servers:  make(map[HostId]*server),
 	}
 	c.self = actor.NewActor(c)
@@ -133,7 +135,6 @@ func (c *client) Handle(msg interface{}) {
 		c.handleReadMessage(msg.HostId, msg.Msg)
 	case writer.MsgMessageWritten:
 		// TODO
-	case MsgNetworkError:
 	case MsgAddHost:
 		if c.clientId == msg.HostId {
 			return
@@ -150,10 +151,14 @@ func (c *client) Handle(msg interface{}) {
 		})
 
 	case msgDial:
+		c.logf("msgDial: c.leaveFuture = %v; msg = %+v", c.leaveFuture, msg)
+		if c.leaveFuture != nil {
+			return
+		}
 		for _, server := range c.servers {
 			if server.state == pendingDial || server.state == pendingRedial {
 				server.state = dialing
-				go dial(server.serverId, c.self)
+				go dial(c.clientId, server.serverId, c.self, c.proxy)
 			}
 		}
 
@@ -185,26 +190,53 @@ func (c *client) Handle(msg interface{}) {
 		server.reader = reader.NewReader(msg.serverId, msg.conn, c.self)
 		server.writer = writer.NewWriter(msg.serverId, msg.conn, c.self)
 
-		joinMsg := &JoinMessage{HostId: c.clientId}
-		for peer := range c.servers {
-			c.logf("handleDialed: peer = %s", peer)
-			joinMsg.Peers = append(joinMsg.Peers, peer)
-		}
 		buf := &bytes.Buffer{}
-		Encode(joinMsg, buf)
+		Encode(c.clientId, buf)
 
 		server.writer.Send(&Message{
 			Body:        buf.Bytes(),
 			MessageId:   NewId(),
 			MessageType: Join,
 		})
+	case MsgLeave:
+		// TODO: Implement
+		c.logf("LEAVE: %v", msg)
+		c.leaveFuture = msg.Result
+		for _, server := range c.servers {
+			c.shutdownServerInNeeded(server)
+		}
+		if len(c.servers) == 0 {
+			c.leaveFuture.SetValue(false)
+		} else {
+			time.AfterFunc(Timeout, func() {
+				c.forceShutdown()
+			})
+		}
+	case MsgNetworkError:
+		if c.leaveFuture != nil {
+			return
+		}
+		// TODO
+		panic(fmt.Sprintf("client cannot handle MsgNetworkError message [%T]: %+v", msg, msg))
 	default:
 		panic(fmt.Sprintf("client cannot handle message [%T]: %+v", msg, msg))
 	}
 }
 
-func dial(serverId HostId, requestor actor.Actor) {
-	conn, err := net.DialTimeout("tcp", string(serverId), RedialInterval*9/10)
+func (c *client) forceShutdown() {
+	for _, server := range c.servers {
+		c.logf("###:2 Shutting down server %s", server)
+		server.reader.Stop()
+		server.writer.Stop()
+		server.conn.Close()
+	}
+	if c.leaveFuture != nil {
+		c.leaveFuture.SetValue(false)
+	}
+}
+
+func dial(clientId, serverId HostId, requestor actor.Actor, _net proxy.Network) {
+	conn, err := _net.Dial(clientId, serverId, RedialInterval*9/10)
 	if err != nil {
 		requestor.Send(msgDialError{serverId, err})
 	} else {
@@ -251,11 +283,12 @@ func (c *client) handleReadMessage(from HostId, msg *Message) {
 		c.handleSubscribed(server, msg)
 	case Unsubscribe:
 		c.handleUnsubscribed(server, msg)
-	case Left:
-		c.handleLeft(server, msg)
+	case Leaving:
+		c.handleLeaving(server, msg)
 	default:
 		panic(fmt.Sprintf("received message: %v", msg))
 	}
+	c.shutdownServerInNeeded(server)
 }
 
 func (c *client) handleJoin(server *server, msg *Message) {
@@ -268,9 +301,28 @@ func (c *client) handleJoin(server *server, msg *Message) {
 	c.logf("handleJoin: joinMessage = %v; peers = %d", joinMessage, len(joinMessage.Peers))
 	for _, peer := range joinMessage.Peers {
 		c.logf("handleJoin: dialing = %s", peer)
-		c.self.Send(msgDial{})
+		if _, exists := c.servers[peer]; !exists {
+			c.servers[peer] = newServer(peer)
+		}
 	}
+	c.self.Send(msgDial{})
 	c.setDialResult()
+}
+
+func (c *client) handleLeaving(server *server, msg *Message) {
+	delete(c.servers, server.serverId)
+
+	pendingFutures := make([]future.Future, len(server.pendingReplies))
+	for _, pf := range server.pendingReplies {
+		pendingFutures = append(pendingFutures, pf)
+	}
+	go waitReplies(pendingFutures)
+}
+
+func waitReplies(pendingFutures []future.Future) {
+	for _, pf := range pendingFutures {
+		pf.Value()
+	}
 }
 
 func (c *client) setDialResult() {
@@ -302,6 +354,25 @@ func (c *client) handleReplyError(server *server, msg *Message, err error) {
 	result.SetValue(err)
 }
 
+func (c *client) shutdownServerInNeeded(server *server) {
+	if c.leaveFuture != nil && len(server.pendingReplies) == 0 {
+		c.logf("###:1 Shutting down server %s", server)
+		if server.reader != nil {
+			server.reader.Stop()
+		}
+		if server.writer != nil {
+			server.writer.Stop()
+		}
+		if server.conn != nil {
+			server.conn.Close()
+		}
+		delete(c.servers, server.serverId)
+		if len(c.servers) == 0 {
+			c.leaveFuture.SetValue(true)
+		}
+	}
+}
+
 func (c *client) handleSubscribed(server *server, msg *Message) {
 	buf := bytes.NewBuffer(msg.Body)
 	var t Topic
@@ -314,20 +385,6 @@ func (c *client) handleUnsubscribed(server *server, msg *Message) {
 	var t Topic
 	Decode(buf, &t)
 	delete(server.topics, t)
-}
-
-func (c *client) handleLeft(server *server, msg *Message) {
-	panic("Implement me.")
-	// if server == nil {
-	// 	return
-	// }
-
-	// server.state = serverStopping
-	// pendingFutures := make([]future.Future, len(server.pendingReplies))
-	// for _, pf := range server.pendingReplies {
-	// 	pendingFutures = append(pendingFutures, pf)
-	// }
-	// go stopPeer(server, pendingFutures, msgr)
 }
 
 func (c *client) handleNetworkError(_ string, info []interface{}) {

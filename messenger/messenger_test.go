@@ -11,6 +11,10 @@ import (
 
 var testError = errors.New("test error")
 
+func init() {
+	// test()
+}
+
 func TestOneOnOne(t *testing.T) {
 	log.Println("---------------- TestOneOnOne ----------------")
 
@@ -21,6 +25,8 @@ func TestOneOnOne(t *testing.T) {
 	server.Join("localhost:20000")
 	defer server.Leave()
 	server.Subscribe("job", echo)
+
+	time.Sleep(10 * time.Millisecond)
 
 	client, err := NewMessenger("localhost:40000")
 	if err != nil {
@@ -41,6 +47,7 @@ func TestOneOnOne(t *testing.T) {
 }
 
 func TestOneOnThree(t *testing.T) {
+	// test()
 	log.Println("---------------- TestOneOnThree ----------------")
 
 	Timeout = time.Duration(5 * time.Second)

@@ -7,9 +7,9 @@ import (
 	"github.com/andrew-suprun/envoy/future"
 	"github.com/andrew-suprun/envoy/messenger/client"
 	. "github.com/andrew-suprun/envoy/messenger/common"
+	"github.com/andrew-suprun/envoy/messenger/proxy"
 	"github.com/andrew-suprun/envoy/messenger/server"
 	"net"
-	"runtime/debug"
 )
 
 type messenger struct {
@@ -18,8 +18,14 @@ type messenger struct {
 	client actor.Actor
 }
 
+var _proxy = proxy.NewNetwork()
+
 func init() {
 	NewMessenger = newMessenger
+}
+
+func test() {
+	_proxy = proxy.NewTestNetwork()
 }
 
 func newMessenger(local string) (Messenger, error) {
@@ -31,7 +37,7 @@ func newMessenger(local string) (Messenger, error) {
 		hostId: localAddr,
 	}
 
-	msgr.server, err = server.NewServer(localAddr)
+	msgr.server, err = server.NewServer(localAddr, _proxy)
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +55,7 @@ func (msgr *messenger) Join(remotes ...string) {
 		}
 	}
 
-	msgr.client = client.NewClent(msgr.hostId)
+	msgr.client = client.NewClent(msgr.hostId, _proxy)
 	msgr.server.Send(server.MsgClient{msgr.client})
 
 	result := future.NewFuture()
@@ -59,7 +65,6 @@ func (msgr *messenger) Join(remotes ...string) {
 }
 
 func (msgr *messenger) Leave() {
-	Log.Debugf("msgr:Leave: stack:\n%s", string(debug.Stack()))
 	f := futures(2)
 
 	msgr.server.Send(MsgLeave{f[0]})
@@ -125,6 +130,7 @@ func (msgr *messenger) Survey(topic string, body []byte) ([][]byte, MessageId, e
 }
 
 func (msgr *messenger) Subscribe(topic string, handler Handler) {
+	Log.Debugf("msgr: Subscribe = %s", topic)
 	msgr.server.Send(server.MsgSubscribe{Topic(topic), handler})
 }
 
@@ -156,46 +162,6 @@ func waitFutures(futures []future.Future) {
 		f.Value()
 	}
 }
-
-// func stopPeer(peer *peer, pendingFutures []future.Future, msgr actor.Actor) {
-// 	for _, pf := range pendingFutures {
-// 		if pf != nil {
-// 			pf.Value()
-// 		}
-// 	}
-// 	msgr.Send("shutdown-peer", peer.peerId)
-// 	if peer.state == peerLeaving {
-// 		Log.Infof("Peer %s left.", peer.peerId)
-// 	}
-// 	peer.writer.Send("write", &message{MessageType: left})
-
-// }
-
-// func (msgr *messenger) handleWriteResult(_ string, info []interface{}) {
-// 	peerId := info[0].(hostId)
-// 	msg := info[1].(*message)
-// 	var err error
-// 	if len(info) > 2 && info[2] != nil {
-// 		err = info[2].(error)
-// 	}
-
-// 	peer := msgr.peers[peerId]
-// 	if peer != nil {
-// 		if err != nil {
-// 			msgr.Send("shutdown-peer", peer.peerId)
-// 			if peerId > msgr.hostId {
-// 				msgr.Send("dial", peerId)
-// 			}
-// 		}
-
-// 		if msg.MessageType == publish || msg.MessageType == subscribe || msg.MessageType == unsubscribe {
-// 			if reply, exists := peer.pendingReplies[msg.MsgId]; exists {
-// 				delete(peer.pendingReplies, msg.MsgId)
-// 				reply.SetError(err)
-// 			}
-// 		}
-// 	}
-// }
 
 // func (msgr *messenger) getTopics() []Topic {
 // 	topics := make([]Topic, 0, len(msgr.subscriptions))

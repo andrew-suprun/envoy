@@ -12,7 +12,7 @@ import (
 type (
 	MsgMessageWritten struct {
 		HostId HostId
-		MsgId  MsgId
+		Msg    *Message
 	}
 )
 
@@ -36,7 +36,7 @@ func (writer *writer) Handle(msg interface{}) {
 	if err != nil {
 		writer.recipient.Send(MsgNetworkError{writer.hostId, err})
 	} else {
-		writer.recipient.Send(MsgMessageWritten{writer.hostId, message.MessageId})
+		writer.recipient.Send(MsgMessageWritten{writer.hostId, message})
 	}
 }
 
