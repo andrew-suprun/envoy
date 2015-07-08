@@ -2,6 +2,7 @@ package messenger
 
 import (
 	"errors"
+	"fmt"
 	. "github.com/andrew-suprun/envoy"
 	"github.com/andrew-suprun/envoy/messenger/proxy"
 	"log"
@@ -334,7 +335,7 @@ func TestPublish(t *testing.T) {
 	defer client.Leave()
 
 	for i := 0; i < 20; i++ {
-		_, err := client.Publish("job", []byte("Hello"))
+		_, err := client.Publish("job", []byte(fmt.Sprintf("Hello-%d", i)))
 		if err != nil {
 			log.Fatalf("Request returned error: %s", err)
 		}

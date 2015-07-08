@@ -126,7 +126,11 @@ func (c *client) Handle(msg interface{}) {
 	case reader.MsgMessageRead:
 		c.handleReadMessage(msg.HostId, msg.Msg)
 	case writer.MsgMessageWritten:
-		// TODO
+		if server := c.servers[msg.HostId]; server != nil {
+			if pr := server.pendingReplies[msg.Msg.MessageId]; pr != nil {
+				pr.Result.SetValue(&Message{MessageId: msg.Msg.MessageId})
+			}
+		}
 	case MsgAddHost:
 		if c.clientId == msg.HostId {
 			return
