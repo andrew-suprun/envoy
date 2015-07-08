@@ -14,6 +14,8 @@ var (
 	dialFailed       = errors.New("Dial failed.")
 	listenFailed     = errors.New("Listen failed.")
 	acceptAfterClose = errors.New("Accept after close.")
+	readError        = errors.New("Simulated read error.")
+	writeError       = errors.New("Simulated write error.")
 )
 
 type Network interface {
@@ -35,15 +37,22 @@ func (n *proxy) Listen(hostId HostId) (net.Listener, error) {
 	return net.Listen("tcp", string(hostId))
 }
 
-type testProxy struct {
-	failDial   bool
-	failListen bool
-	listeners  map[HostId]*listener
-	clientInd  int64
+type ProxyParams struct {
+	FailDial   bool
+	FailListen bool
+	FailRead   bool
+	FailWrite  bool
 }
 
-func NewTestNetwork() Network {
+type testProxy struct {
+	params    ProxyParams
+	listeners map[HostId]*listener
+	clientInd int64
+}
+
+func NewTestNetwork(params ProxyParams) Network {
 	return &testProxy{
+		params:    params,
 		listeners: make(map[HostId]*listener),
 	}
 }
@@ -52,7 +61,7 @@ func (p *testProxy) Dial(local, remote HostId, timeout time.Duration) (net.Conn,
 	ind := atomic.AddInt64(&p.clientInd, 1)
 	local = HostId(fmt.Sprintf("%s[%d]", local, ind))
 	log.Printf(">>> Dial %s->%s", local, remote)
-	if p.failDial {
+	if p.params.FailDial {
 		return nil, dialFailed
 	}
 	l := p.listeners[remote]
@@ -64,29 +73,31 @@ func (p *testProxy) Dial(local, remote HostId, timeout time.Duration) (net.Conn,
 	c1, c2 := net.Pipe()
 	l.acceptChan <- acceptedConn{c2, local}
 
-	return newConn(c1, local, remote), nil
+	return newConn(c1, local, remote, p.params), nil
 }
 
 func (n *testProxy) Listen(hostId HostId) (net.Listener, error) {
 	log.Printf(">>> Listen %s", hostId)
-	if n.failListen {
+	if n.params.FailListen {
 		return nil, listenFailed
 	}
-	l := newListener(hostId)
+	l := newListener(hostId, n.params)
 	n.listeners[hostId] = l
 	return l, nil
 }
 
-func newListener(hostId HostId) *listener {
+func newListener(hostId HostId, params ProxyParams) *listener {
 	return &listener{
 		hostId:     hostId,
 		acceptChan: make(chan acceptedConn),
+		params:     params,
 	}
 }
 
 type listener struct {
 	hostId     HostId
 	acceptChan chan acceptedConn
+	params     ProxyParams
 }
 
 type acceptedConn struct {
@@ -101,7 +112,7 @@ func (l *listener) Accept() (c net.Conn, err error) {
 	}
 
 	log.Printf(">>> Accepted %s<-%s", l.hostId, conn.hostId)
-	return newConn(conn.conn, l.hostId, conn.hostId), nil
+	return newConn(conn.conn, l.hostId, conn.hostId, l.params), nil
 }
 
 func (l *listener) Close() error {
@@ -126,14 +137,15 @@ func (a addr) String() string {
 	return string(a)
 }
 
-func newConn(_conn net.Conn, local, remote HostId) net.Conn {
-	return &conn{_conn, local, remote}
+func newConn(_conn net.Conn, local, remote HostId, params ProxyParams) net.Conn {
+	return &conn{_conn, local, remote, params}
 }
 
 type conn struct {
 	net.Conn
 	local  HostId
 	remote HostId
+	params ProxyParams
 }
 
 func (c *conn) LocalAddr() net.Addr {
@@ -142,4 +154,26 @@ func (c *conn) LocalAddr() net.Addr {
 
 func (c *conn) RemoteAddr() net.Addr {
 	return addr(c.remote)
+}
+
+var counter int64
+
+func (c *conn) Read(b []byte) (n int, err error) {
+	if c.params.FailRead {
+		cc := atomic.AddInt64(&counter, 1)
+		if cc%100 == 0 {
+			return 0, readError
+		}
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *conn) Write(b []byte) (n int, err error) {
+	if c.params.FailWrite {
+		cc := atomic.AddInt64(&counter, 1)
+		if cc%100 == 0 {
+			return 0, writeError
+		}
+	}
+	return c.Conn.Write(b)
 }

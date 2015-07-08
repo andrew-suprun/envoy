@@ -15,8 +15,9 @@ func NewActor(handler Handler) Actor {
 
 type Actor interface {
 	Send(message interface{})
-	Stop()
 }
+
+type MsgStop struct{}
 
 type Handler interface {
 	Handle(interface{})
@@ -26,11 +27,10 @@ type actor struct {
 	handler Handler
 	pending []interface{}
 	*sync.Cond
-	stopped bool
 }
 
 func run(a *actor) {
-	for !a.stopped {
+	for {
 		a.Cond.L.Lock()
 
 		if len(a.pending) == 0 {
@@ -43,21 +43,17 @@ func run(a *actor) {
 		a.pending = a.pending[1:]
 
 		a.Cond.L.Unlock()
-
 		a.handler.Handle(msg)
+
+		if _, ok := msg.(MsgStop); ok {
+			return
+		}
 	}
 }
 
 func (a *actor) Send(msg interface{}) {
 	a.Cond.L.Lock()
 	a.pending = append(a.pending, msg)
-	a.Cond.Signal()
-	a.Cond.L.Unlock()
-}
-
-func (a *actor) Stop() {
-	a.Cond.L.Lock()
-	a.stopped = true
 	a.Cond.Signal()
 	a.Cond.L.Unlock()
 }

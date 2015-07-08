@@ -1,6 +1,7 @@
 package listener
 
 import (
+	"fmt"
 	. "github.com/andrew-suprun/envoy"
 	"github.com/andrew-suprun/envoy/actor"
 	. "github.com/andrew-suprun/envoy/messenger/common"
@@ -10,6 +11,7 @@ import (
 )
 
 type (
+	MsgAccept       struct{}
 	MsgConnAccepted struct{ net.Conn }
 	MsgAcceptFailed struct{}
 )
@@ -22,7 +24,7 @@ type listener struct {
 	stopped   bool
 }
 
-func NewListener(hostId HostId, recipient actor.Actor, _net proxy.Network) (actor.Actor, error) {
+func NewListener(hostId HostId, recipient actor.Actor, _net proxy.Network) (actor.Actor, net.Listener, error) {
 	lsnr := &listener{
 		hostId:    hostId,
 		recipient: recipient,
@@ -33,20 +35,27 @@ func NewListener(hostId HostId, recipient actor.Actor, _net proxy.Network) (acto
 	lsnr.listener, err = _net.Listen(hostId)
 	if err != nil {
 		Log.Errorf("Failed to listen on %s. Exiting.", hostId)
-		return nil, err
+		return nil, nil, err
 	}
 	Log.Infof("Listening on: %s", hostId)
-	lsnr.self.Send(nil)
-	return lsnr.self, nil
+	lsnr.self.Send(MsgAccept{})
+	return lsnr.self, lsnr.listener, nil
 }
 
-func (lsnr *listener) Handle(_ interface{}) {
-	conn, err := lsnr.listener.Accept()
-	if err != nil {
-		lsnr.recipient.Send(MsgAcceptFailed{})
-		return
+func (lsnr *listener) Handle(msg interface{}) {
+	switch msg.(type) {
+	case MsgAccept:
+		conn, err := lsnr.listener.Accept()
+		if err != nil {
+			lsnr.recipient.Send(MsgAcceptFailed{})
+			return
+		}
+		lsnr.recipient.Send(MsgConnAccepted{conn})
+	case actor.MsgStop:
+		// nothing to do
+	default:
+		panic(fmt.Sprintf("listener got unknown message[%T]: %v", msg, msg))
 	}
-	lsnr.recipient.Send(MsgConnAccepted{conn})
 }
 
 func (lsnr *listener) String() string {

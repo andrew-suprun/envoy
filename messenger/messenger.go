@@ -24,8 +24,8 @@ func init() {
 	NewMessenger = newMessenger
 }
 
-func test() {
-	_proxy = proxy.NewTestNetwork()
+func test(params proxy.ProxyParams) {
+	_proxy = proxy.NewTestNetwork(params)
 }
 
 func newMessenger(local string) (Messenger, error) {
@@ -75,7 +75,15 @@ func (msgr *messenger) Leave() {
 
 func (msgr *messenger) Publish(topic string, body []byte) (MessageId, error) {
 	result := future.NewFuture()
-	msgr.client.Send(client.MsgPublish{Topic(topic), body, Publish, result})
+	msgr.client.Send(&client.MsgPublish{
+		Msg: Message{
+			Topic:       Topic(topic),
+			Body:        body,
+			MessageType: Publish,
+			MessageId:   NewId(),
+		},
+		Result: result,
+	})
 
 	switch msg := result.Value().(type) {
 	case *Message:
@@ -89,7 +97,15 @@ func (msgr *messenger) Publish(topic string, body []byte) (MessageId, error) {
 
 func (msgr *messenger) Request(topic string, body []byte) ([]byte, MessageId, error) {
 	result := future.NewFuture()
-	msgr.client.Send(client.MsgPublish{Topic(topic), body, Request, result})
+	msgr.client.Send(&client.MsgPublish{
+		Msg: Message{
+			Topic:       Topic(topic),
+			Body:        body,
+			MessageType: Request,
+			MessageId:   NewId(),
+		},
+		Result: result,
+	})
 
 	switch msg := result.Value().(type) {
 	case *Message:
@@ -103,7 +119,15 @@ func (msgr *messenger) Request(topic string, body []byte) ([]byte, MessageId, er
 
 func (msgr *messenger) Broadcast(topic string, body []byte) (MessageId, error) {
 	result := future.NewFuture()
-	msgr.client.Send(client.MsgPublish{Topic(topic), body, Broadcast, result})
+	msgr.client.Send(&client.MsgPublish{
+		Msg: Message{
+			Topic:       Topic(topic),
+			Body:        body,
+			MessageType: Broadcast,
+			MessageId:   NewId(),
+		},
+		Result: result,
+	})
 
 	switch msg := result.Value().(type) {
 	case *Message:
@@ -117,7 +141,15 @@ func (msgr *messenger) Broadcast(topic string, body []byte) (MessageId, error) {
 
 func (msgr *messenger) Survey(topic string, body []byte) ([][]byte, MessageId, error) {
 	result := future.NewFuture()
-	msgr.client.Send(client.MsgPublish{Topic(topic), body, Survey, result})
+	msgr.client.Send(&client.MsgPublish{
+		Msg: Message{
+			Topic:       Topic(topic),
+			Body:        body,
+			MessageType: Survey,
+			MessageId:   NewId(),
+		},
+		Result: result,
+	})
 
 	switch msg := result.Value().(type) {
 	case *Message:

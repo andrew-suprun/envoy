@@ -9,6 +9,7 @@ import (
 )
 
 type (
+	MsgRead        struct{}
 	MsgMessageRead struct {
 		HostId HostId
 		Msg    *Message
@@ -29,17 +30,20 @@ func NewReader(hostId HostId, conn net.Conn, recipient actor.Actor) actor.Actor 
 		recipient: recipient,
 	}
 	reader.self = actor.NewActor(reader)
-	reader.self.Send(nil)
+	reader.self.Send(MsgRead{})
 	return reader.self
 }
 
-func (r *reader) Handle(_ interface{}) {
-	msg, err := readMessage(r.conn)
-	if err != nil {
-		r.recipient.Send(MsgNetworkError{r.hostId, err})
-	} else {
-		r.recipient.Send(MsgMessageRead{r.hostId, msg})
-		r.self.Send(nil)
+func (r *reader) Handle(msg interface{}) {
+	switch msg.(type) {
+	case MsgRead:
+		readMsg, err := readMessage(r.conn)
+		if err != nil {
+			r.recipient.Send(MsgNetworkError{r.hostId, err})
+		} else {
+			r.recipient.Send(MsgMessageRead{r.hostId, readMsg})
+			r.self.Send(MsgRead{})
+		}
 	}
 }
 

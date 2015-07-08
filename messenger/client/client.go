@@ -27,10 +27,9 @@ type client struct {
 type server struct {
 	serverId       HostId
 	topics         map[Topic]struct{}
-	pendingReplies map[MsgId]future.Future
+	pendingReplies map[MsgId]*MsgPublish
 	reader         actor.Actor
 	writer         actor.Actor
-	conn           net.Conn
 	state          state
 }
 
@@ -50,16 +49,14 @@ type (
 		Result  future.Future
 	}
 	MsgPublish struct {
-		Topic   Topic
-		Body    []byte
-		MsgType MsgType
-		Result  future.Future
+		Msg    Message
+		Result future.Future
 	}
 )
 
 type (
 	msgDialer    struct{}
-	msgDial      struct{}
+	msgDial      struct{ onlyNew bool }
 	msgDialError struct {
 		serverId HostId
 		err      error
@@ -68,6 +65,7 @@ type (
 		serverId HostId
 		conn     net.Conn
 	}
+	msgLeaveIfNedded struct{}
 )
 
 func NewClent(clientId HostId, _net proxy.Network) actor.Actor {
@@ -84,7 +82,7 @@ func newServer(serverId HostId) *server {
 	return &server{
 		serverId:       serverId,
 		topics:         make(map[Topic]struct{}),
-		pendingReplies: make(map[MsgId]future.Future),
+		pendingReplies: make(map[MsgId]*MsgPublish),
 		state:          pendingDial,
 	}
 }
@@ -106,31 +104,25 @@ func (c *client) Handle(msg interface{}) {
 		}
 
 		c.self.Send(msgDialer{})
-	case MsgPublish:
+	case *MsgPublish:
 		if c.leaveFuture != nil {
 			msg.Result.SetValue(ServerDisconnectedError)
 			return
 		}
 
-		server := c.selectTopicServer(msg.Topic)
+		server := c.selectTopicServer(msg.Msg.Topic)
 		if server == nil {
 			msg.Result.SetValue(NoSubscribersError)
 			return
 		}
-		msgId := NewId()
 		time.AfterFunc(Timeout, func() {
 			c.self.Send(reader.MsgMessageRead{HostId: server.serverId, Msg: &Message{
-				MessageId:   msgId,
+				MessageId:   msg.Msg.MessageId,
 				MessageType: ReplyTimeout,
 			}})
 		})
-		server.pendingReplies[msgId] = msg.Result
-		server.writer.Send(&Message{
-			Topic:       msg.Topic,
-			Body:        msg.Body,
-			MessageId:   msgId,
-			MessageType: msg.MsgType,
-		})
+		server.pendingReplies[msg.Msg.MessageId] = msg
+		server.writer.Send(&msg.Msg)
 	case reader.MsgMessageRead:
 		c.handleReadMessage(msg.HostId, msg.Msg)
 	case writer.MsgMessageWritten:
@@ -143,20 +135,19 @@ func (c *client) Handle(msg interface{}) {
 			return
 		}
 		c.servers[msg.HostId] = newServer(msg.HostId)
-		c.self.Send(msgDial{})
+		c.self.Send(msgDial{onlyNew: true})
 	case msgDialer:
-		c.self.Send(msgDial{})
+		c.self.Send(msgDial{onlyNew: true})
 		time.AfterFunc(RedialInterval, func() {
 			c.self.Send(msgDialer{})
 		})
 
 	case msgDial:
-		c.logf("msgDial: c.leaveFuture = %v; msg = %+v", c.leaveFuture, msg)
 		if c.leaveFuture != nil {
 			return
 		}
 		for _, server := range c.servers {
-			if server.state == pendingDial || server.state == pendingRedial {
+			if server.state == pendingDial || (server.state == pendingRedial && !msg.onlyNew) {
 				server.state = dialing
 				go dial(c.clientId, server.serverId, c.self, c.proxy)
 			}
@@ -172,8 +163,6 @@ func (c *client) Handle(msg interface{}) {
 		c.setDialResult()
 
 	case msgDialed:
-		c.logf("handleDialed: serverId = %s; conn = %s/%s", msg.serverId, msg.conn.LocalAddr(), msg.conn.RemoteAddr())
-
 		server, ok := c.servers[msg.serverId]
 		if !ok {
 			Log.Errorf("Dialed to non-existing server: %s", msg.serverId)
@@ -186,7 +175,6 @@ func (c *client) Handle(msg interface{}) {
 		}
 
 		server.state = dialed
-		server.conn = msg.conn
 		server.reader = reader.NewReader(msg.serverId, msg.conn, c.self)
 		server.writer = writer.NewWriter(msg.serverId, msg.conn, c.self)
 
@@ -199,8 +187,6 @@ func (c *client) Handle(msg interface{}) {
 			MessageType: Join,
 		})
 	case MsgLeave:
-		// TODO: Implement
-		c.logf("LEAVE: %v", msg)
 		c.leaveFuture = msg.Result
 		for _, server := range c.servers {
 			c.shutdownServerInNeeded(server)
@@ -212,23 +198,33 @@ func (c *client) Handle(msg interface{}) {
 				c.forceShutdown()
 			})
 		}
+	case msgLeaveIfNedded:
+		if c.leaveFuture != nil && len(c.servers) == 0 {
+			c.leaveFuture.SetValue(false)
+		}
 	case MsgNetworkError:
 		if c.leaveFuture != nil {
 			return
 		}
-		// TODO
-		panic(fmt.Sprintf("client cannot handle MsgNetworkError message [%T]: %+v", msg, msg))
+
+		server := c.servers[msg.HostId]
+		if server == nil {
+			return
+		}
+		server.state = pendingDial
+		for _, pr := range server.pendingReplies {
+			c.self.Send(pr)
+		}
+		c.self.Send(msgDial{onlyNew: true})
 	default:
-		panic(fmt.Sprintf("client cannot handle message [%T]: %+v", msg, msg))
+		panic(fmt.Sprintf("client %s cannot handle message [%T]: %+v", c.clientId, msg, msg))
 	}
 }
 
 func (c *client) forceShutdown() {
 	for _, server := range c.servers {
-		c.logf("###:2 Shutting down server %s", server)
-		server.reader.Stop()
-		server.writer.Stop()
-		server.conn.Close()
+		server.reader.Send(actor.MsgStop{})
+		server.writer.Send(actor.MsgStop{})
 	}
 	if c.leaveFuture != nil {
 		c.leaveFuture.SetValue(false)
@@ -256,8 +252,10 @@ func (c *client) selectTopicServer(t Topic) *server {
 func (c *client) getServersByTopic(t Topic) []*server {
 	result := []*server{}
 	for _, server := range c.servers {
-		if _, found := server.topics[t]; found {
-			result = append(result, server)
+		if server.state == connected {
+			if _, found := server.topics[t]; found {
+				result = append(result, server)
+			}
 		}
 	}
 	return result
@@ -298,31 +296,35 @@ func (c *client) handleJoin(server *server, msg *Message) {
 		server.topics[topic] = struct{}{}
 	}
 	server.state = connected
-	c.logf("handleJoin: joinMessage = %v; peers = %d", joinMessage, len(joinMessage.Peers))
 	for _, peer := range joinMessage.Peers {
-		c.logf("handleJoin: dialing = %s", peer)
 		if _, exists := c.servers[peer]; !exists {
 			c.servers[peer] = newServer(peer)
 		}
 	}
-	c.self.Send(msgDial{})
+	c.self.Send(msgDial{onlyNew: true})
 	c.setDialResult()
 }
 
 func (c *client) handleLeaving(server *server, msg *Message) {
 	delete(c.servers, server.serverId)
-
-	pendingFutures := make([]future.Future, len(server.pendingReplies))
-	for _, pf := range server.pendingReplies {
-		pendingFutures = append(pendingFutures, pf)
-	}
-	go waitReplies(pendingFutures)
+	go waitReplies(server, c.self, c.clientId)
 }
 
-func waitReplies(pendingFutures []future.Future) {
-	for _, pf := range pendingFutures {
-		pf.Value()
+func waitReplies(server *server, self actor.Actor, clientId HostId) {
+	time.AfterFunc(Timeout, func() {
+		for _, pr := range server.pendingReplies {
+			pr.Result.SetValue(TimeoutError)
+		}
+	})
+	for _, pr := range server.pendingReplies {
+		pr.Result.Value()
 	}
+	server.writer.Send(&Message{MessageType: Left})
+
+	server.reader.Send(actor.MsgStop{})
+	server.writer.Send(actor.MsgStop{})
+
+	self.Send(msgLeaveIfNedded{})
 }
 
 func (c *client) setDialResult() {
@@ -339,38 +341,45 @@ func (c *client) setDialResult() {
 }
 
 func (c *client) handleReply(server *server, msg *Message) {
-	result := server.pendingReplies[msg.MessageId]
+	result, ok := server.pendingReplies[msg.MessageId]
 	delete(server.pendingReplies, msg.MessageId)
-	if result == nil {
+	if !ok {
 		Log.Errorf("Received unexpected reply for '%s'. Ignored.", msg.Topic)
 		return
 	}
-	result.SetValue(msg)
+	result.Result.SetValue(msg)
 }
 
 func (c *client) handleReplyError(server *server, msg *Message, err error) {
-	result := server.pendingReplies[msg.MessageId]
+	result, ok := server.pendingReplies[msg.MessageId]
 	delete(server.pendingReplies, msg.MessageId)
-	result.SetValue(err)
+	if ok {
+		result.Result.SetValue(err)
+	}
 }
 
 func (c *client) shutdownServerInNeeded(server *server) {
 	if c.leaveFuture != nil && len(server.pendingReplies) == 0 {
-		c.logf("###:1 Shutting down server %s", server)
 		if server.reader != nil {
-			server.reader.Stop()
+			server.reader.Send(actor.MsgStop{})
 		}
 		if server.writer != nil {
-			server.writer.Stop()
-		}
-		if server.conn != nil {
-			server.conn.Close()
+			server.writer.Send(actor.MsgStop{})
 		}
 		delete(c.servers, server.serverId)
-		if len(c.servers) == 0 {
+		if c.connectedServers() == 0 {
 			c.leaveFuture.SetValue(true)
 		}
 	}
+}
+
+func (c *client) connectedServers() (servers int) {
+	for _, server := range c.servers {
+		if server.state == connected {
+			servers++
+		}
+	}
+	return servers
 }
 
 func (c *client) handleSubscribed(server *server, msg *Message) {
@@ -387,49 +396,8 @@ func (c *client) handleUnsubscribed(server *server, msg *Message) {
 	delete(server.topics, t)
 }
 
-func (c *client) handleNetworkError(_ string, info []interface{}) {
-	panic("Implement me.")
-	// serverId := info[0].(clientId)
-	// err := info[1].(error)
-	// if c.state == messengerLeaving {
-	// 	c.Send("shutdown-server", serverId)
-	// 	return
-	// }
-	// if server, found := c.servers[serverId]; found {
-	// 	if server.state == serverStopping || server.state == serverLeaving {
-	// 		return
-	// 	}
-	// 	server.state = serverStopping
-	// 	if err.Error() == "EOF" {
-	// 		Log.Errorf("Peer %s disconnected. Will try to re-connect.", serverId)
-	// 	} else {
-	// 		Log.Errorf("Peer %s: Network error: %v. Will try to re-connect.", serverId, err)
-	// 	}
-
-	// 	c.Send("shutdown-server", server.serverId)
-
-	// 	if serverId > c.clientId {
-	// 		time.AfterFunc(time.Millisecond, func() {
-	// 			c.Send("dial", serverId)
-	// 		})
-	// 	} else {
-	// 		time.AfterFunc(RedialInterval, func() {
-	// 			c.Send("dial", serverId)
-	// 		})
-	// 	}
-	// }
-}
-
-func (c *client) handleLeave(_ string, info []interface{}) {
-	// panic("Implement me.")
-	// c.leaveFuture = info[0].(future.Future)
-	// if len(c.servers) == 0 {
-	// 	c.leaveFuture.SetValue(true)
-	// }
-}
-
 func (s *server) String() string {
-	return fmt.Sprintf("server: state = %s", s.state)
+	return fmt.Sprintf("[server %s: state: %s; topics: %v; pending: %d]", s.serverId, s.state, s.topics, len(s.pendingReplies))
 }
 
 func (s state) String() string {

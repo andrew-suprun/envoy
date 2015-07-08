@@ -31,12 +31,16 @@ func NewWriter(hostId HostId, conn net.Conn, recipient actor.Actor) actor.Actor 
 }
 
 func (writer *writer) Handle(msg interface{}) {
-	message := msg.(*Message)
-	err := writeMessage(writer.conn, message)
-	if err != nil {
-		writer.recipient.Send(MsgNetworkError{writer.hostId, err})
-	} else {
-		writer.recipient.Send(MsgMessageWritten{writer.hostId, message})
+	switch msg := msg.(type) {
+	case *Message:
+		err := writeMessage(writer.conn, msg)
+		if err != nil {
+			writer.recipient.Send(MsgNetworkError{writer.hostId, err})
+		} else {
+			writer.recipient.Send(MsgMessageWritten{writer.hostId, msg})
+		}
+	case actor.MsgStop:
+		writer.conn.Close()
 	}
 }
 

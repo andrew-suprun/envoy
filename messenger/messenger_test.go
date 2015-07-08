@@ -3,6 +3,7 @@ package messenger
 import (
 	"errors"
 	. "github.com/andrew-suprun/envoy"
+	"github.com/andrew-suprun/envoy/messenger/proxy"
 	"log"
 	"sync"
 	"testing"
@@ -25,8 +26,6 @@ func TestOneOnOne(t *testing.T) {
 	server.Join("localhost:20000")
 	defer server.Leave()
 	server.Subscribe("job", echo)
-
-	time.Sleep(10 * time.Millisecond)
 
 	client, err := NewMessenger("localhost:40000")
 	if err != nil {
@@ -197,6 +196,8 @@ func TestTwoOnTwo(t *testing.T) {
 }
 
 func TestDisconnect(t *testing.T) {
+	// test(proxy.ProxyParams{FailRead: true, FailWrite: true})
+	test(proxy.ProxyParams{FailWrite: true})
 	log.Println("---------------- TestDisconnect ----------------")
 
 	Timeout = 2 * time.Second

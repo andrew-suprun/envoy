@@ -82,12 +82,20 @@ func (mType MsgType) String() string {
 		return "request"
 	case Reply:
 		return "reply"
+	case Broadcast:
+		return "broadcast"
+	case Survey:
+		return "survey"
+	case ReplyTimeout:
+		return "replyTimeout"
 	case ReplyPanic:
 		return "replyPanic"
 	case Join:
 		return "join"
 	case Leaving:
 		return "leaving"
+	case Left:
+		return "left"
 	case Subscribe:
 		return "subscribe"
 	case Unsubscribe:
