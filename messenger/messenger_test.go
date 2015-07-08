@@ -196,8 +196,10 @@ func TestTwoOnTwo(t *testing.T) {
 }
 
 func TestDisconnect(t *testing.T) {
-	// test(proxy.ProxyParams{FailRead: true, FailWrite: true})
-	test(proxy.ProxyParams{FailWrite: true})
+	test(proxy.ProxyParams{FailRead: true, FailWrite: true})
+	// test(proxy.ProxyParams{FailWrite: true})
+	// test(proxy.ProxyParams{FailRead: true})
+	// test(proxy.ProxyParams{})
 	log.Println("---------------- TestDisconnect ----------------")
 
 	Timeout = 2 * time.Second

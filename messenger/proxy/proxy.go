@@ -119,7 +119,6 @@ func (l *listener) Close() error {
 	for len(l.acceptChan) > 0 {
 		l.acceptChan <- acceptedConn{nil, ""}
 	}
-	close(l.acceptChan)
 	return nil
 }
 
@@ -162,9 +161,11 @@ func (c *conn) Read(b []byte) (n int, err error) {
 	if c.params.FailRead {
 		cc := atomic.AddInt64(&counter, 1)
 		if cc%100 == 0 {
+			log.Printf("### read error: %s-%s", c.LocalAddr(), c.RemoteAddr())
 			return 0, readError
 		}
 	}
+	// log.Printf("~~~ read: %s-%s", c.LocalAddr(), c.RemoteAddr())
 	return c.Conn.Read(b)
 }
 
@@ -172,8 +173,10 @@ func (c *conn) Write(b []byte) (n int, err error) {
 	if c.params.FailWrite {
 		cc := atomic.AddInt64(&counter, 1)
 		if cc%100 == 0 {
+			log.Printf("### write error: %s-%s", c.LocalAddr(), c.RemoteAddr())
 			return 0, writeError
 		}
 	}
+	// log.Printf("~~~ write: %s-%s", c.LocalAddr(), c.RemoteAddr())
 	return c.Conn.Write(b)
 }

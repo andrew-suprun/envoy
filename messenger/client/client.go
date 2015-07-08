@@ -146,12 +146,25 @@ func (c *client) Handle(msg interface{}) {
 		if c.leaveFuture != nil {
 			return
 		}
+		servers := map[HostId]*server{}
 		for _, server := range c.servers {
-			if server.state == pendingDial || (server.state == pendingRedial && !msg.onlyNew) {
-				server.state = dialing
-				go dial(c.clientId, server.serverId, c.self, c.proxy)
+			if server.serverId != c.clientId {
+				if server.state == pendingDial || (server.state == pendingRedial && !msg.onlyNew) {
+					servers[server.serverId] = server
+				}
 			}
 		}
+		serverIds := []HostId{}
+		for serverIs := range servers {
+			serverIds = append(serverIds, serverIs)
+		}
+		c.logf("msgDial.1: dialing %s", serverIds)
+
+		for _, server := range servers {
+			server.state = dialing
+			go dial(c.clientId, server.serverId, c.self, c.proxy)
+		}
+		c.logf("msgDial.2: dialing %s", serverIds)
 
 	case msgDialError:
 		server := c.servers[msg.serverId]
@@ -163,6 +176,7 @@ func (c *client) Handle(msg interface{}) {
 		c.setDialResult()
 
 	case msgDialed:
+		c.logf("msgDialed: dialed = %s", msg.serverId)
 		server, ok := c.servers[msg.serverId]
 		if !ok {
 			Log.Errorf("Dialed to non-existing server: %s", msg.serverId)
@@ -203,19 +217,32 @@ func (c *client) Handle(msg interface{}) {
 			c.leaveFuture.SetValue(false)
 		}
 	case MsgNetworkError:
-		if c.leaveFuture != nil {
-			return
-		}
-
 		server := c.servers[msg.HostId]
 		if server == nil {
 			return
 		}
-		server.state = pendingDial
+
+		c.logf("MsgNetworkError: serverId = %s", msg.HostId)
+
+		if server.reader != nil {
+			server.reader.Send(actor.MsgStop{})
+		}
+		if server.writer != nil {
+			server.writer.Send(actor.MsgStop{})
+		}
+
 		for _, pr := range server.pendingReplies {
 			c.self.Send(pr)
 		}
+
+		if c.leaveFuture != nil {
+			return
+		}
+
+		server = newServer(msg.HostId)
+		c.servers[msg.HostId] = server
 		c.self.Send(msgDial{onlyNew: true})
+
 	default:
 		panic(fmt.Sprintf("client %s cannot handle message [%T]: %+v", c.clientId, msg, msg))
 	}
@@ -296,8 +323,10 @@ func (c *client) handleJoin(server *server, msg *Message) {
 		server.topics[topic] = struct{}{}
 	}
 	server.state = connected
+	c.logf("handleJoin: connected = %s", server.serverId)
 	for _, peer := range joinMessage.Peers {
 		if _, exists := c.servers[peer]; !exists {
+			c.logf("handleJoin: newServer: %s", peer)
 			c.servers[peer] = newServer(peer)
 		}
 	}
