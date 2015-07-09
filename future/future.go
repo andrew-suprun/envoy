@@ -8,6 +8,7 @@ import (
 type Future interface {
 	Value() interface{}
 	SetValue(value interface{})
+	IsSet() bool
 }
 
 func NewFuture() Future {
@@ -42,6 +43,13 @@ func (f *future) SetValue(value interface{}) {
 		f.cond.Broadcast()
 	}
 	f.cond.L.Unlock()
+}
+
+func (f *future) IsSet() bool {
+	f.cond.L.Lock()
+	isSet := f.set
+	f.cond.L.Unlock()
+	return isSet
 }
 
 func (f *future) String() string {

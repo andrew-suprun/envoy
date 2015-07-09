@@ -3,7 +3,6 @@ package server
 import (
 	"bytes"
 	"fmt"
-	. "github.com/andrew-suprun/envoy"
 	"github.com/andrew-suprun/envoy/actor"
 	"github.com/andrew-suprun/envoy/future"
 	. "github.com/andrew-suprun/envoy/messenger/common"
@@ -13,7 +12,6 @@ import (
 	"github.com/andrew-suprun/envoy/messenger/writer"
 	"net"
 	"runtime/debug"
-	"time"
 )
 
 type (
@@ -24,8 +22,6 @@ type (
 	}
 	MsgUnsubscribe struct{ Topic Topic }
 )
-
-type closeListener struct{}
 
 type server struct {
 	self          actor.Actor
@@ -39,12 +35,10 @@ type server struct {
 }
 
 type client struct {
-	clientId       HostId
-	serverAddr     HostId
-	topics         map[Topic]struct{}
-	pendingReplies map[MsgId]future.Future
-	reader         actor.Actor
-	writer         actor.Actor
+	clientId   HostId
+	serverAddr HostId
+	reader     actor.Actor
+	writer     actor.Actor
 }
 
 func NewServer(hostId HostId, _net proxy.Network) (actor.Actor, error) {
@@ -82,11 +76,9 @@ func (s *server) Handle(msg interface{}) {
 
 		clientId := HostId(msg.Conn.RemoteAddr().String())
 		client := &client{
-			clientId:       clientId,
-			topics:         make(map[Topic]struct{}),
-			pendingReplies: make(map[MsgId]future.Future),
-			reader:         reader.NewReader(clientId, msg.Conn, s.self),
-			writer:         writer.NewWriter(clientId, msg.Conn, s.self),
+			clientId: clientId,
+			reader:   reader.NewReader(clientId, msg.Conn, s.self),
+			writer:   writer.NewWriter(clientId, msg.Conn, s.self),
 		}
 
 		s.clients[client.clientId] = client
@@ -112,8 +104,6 @@ func (s *server) Handle(msg interface{}) {
 		switch msg.Msg.MessageType {
 		case Join:
 			s.handleJoin(client, msg.Msg)
-		case Left:
-			s.handleLeft(client)
 		case Publish, Request:
 			s.handleRequest(client, msg.Msg)
 		default:
@@ -121,13 +111,6 @@ func (s *server) Handle(msg interface{}) {
 		}
 
 	case writer.MsgMessageWritten:
-		if msg.Msg.MessageType == Publish || msg.Msg.MessageType == Broadcast {
-			if client := s.clients[msg.HostId]; client != nil {
-				if pending := client.pendingReplies[msg.Msg.MessageId]; pending != nil {
-					pending.SetValue(true)
-				}
-			}
-		}
 
 	case MsgSubscribe:
 		s.subscriptions[msg.Topic] = msg.Handler
@@ -136,41 +119,48 @@ func (s *server) Handle(msg interface{}) {
 		delete(s.subscriptions, msg.Topic)
 
 	case MsgLeave:
-		// TODO: Implement
+		s.logf("~~~ MsgLeave")
 		s.leaveFuture = msg.Result
 		for _, client := range s.clients {
 			client.writer.Send(&Message{MessageType: Leaving})
 		}
+		s.closeListener()
 		if len(s.clients) == 0 {
-			s.self.Send(closeListener{})
-		} else {
-			time.AfterFunc(Timeout, func() {
-				s.self.Send(closeListener{})
-			})
+			s.leaveFuture.SetValue(true)
 		}
 
-	case closeListener:
-		if s.netListener == nil {
-			return
-		}
-		s.netListener.Close()
-		s.listener.Send(actor.MsgStop{})
-		if s.leaveFuture != nil {
-			s.leaveFuture.SetValue(false)
-		}
-		s.netListener = nil
 	case listener.MsgAcceptFailed:
 		if s.leaveFuture != nil {
 			return
 		}
 		// TODO
+		s.logf("accept failed")
 		panic("accept failed")
 
 	case MsgNetworkError:
+		s.logf("MsgNetworkError: host = %s; err = %v", msg.HostId, msg.Err)
+		client := s.clients[msg.HostId]
+		if client != nil {
+			s.logf("MsgNetworkError: client = %s", client)
+		} else {
+			s.logf("MsgNetworkError: no client")
+		}
 		s.handleLeft(s.clients[msg.HostId])
 
 	default:
 		panic(fmt.Sprintf("server cannot handle message [%T]: %+v", msg, msg))
+	}
+}
+
+func (s *server) closeListener() {
+	if s.netListener == nil {
+		return
+	}
+	s.netListener.Close()
+	s.listener.Send(actor.MsgStop{})
+	s.netListener = nil
+	if s.leaveFuture != nil {
+		s.leaveFuture.SetValue(false)
 	}
 }
 
@@ -189,7 +179,7 @@ func (s *server) handleJoin(client *client, msg *Message) {
 	Decode(bytes.NewBuffer(msg.Body), &hostId)
 	client.serverAddr = hostId
 	s.client.Send(MsgAddHost{hostId})
-	Log.Infof("Joined by %s", hostId)
+	Log.Infof("Peer %s joined.", hostId)
 }
 
 func (s *server) handleLeft(client *client) {
@@ -200,9 +190,10 @@ func (s *server) handleLeft(client *client) {
 	delete(s.clients, client.clientId)
 	client.reader.Send(actor.MsgStop{})
 	client.writer.Send(actor.MsgStop{})
+	Log.Infof("Peer %s left.", client.serverAddr)
 
 	if s.leaveFuture != nil && len(s.clients) == 0 {
-		s.self.Send(closeListener{})
+		s.leaveFuture.SetValue(true)
 	}
 }
 
@@ -248,63 +239,6 @@ func (s *server) runHandlerProtected(msg *Message, handler Handler) (result []by
 	result = handler(string(msg.Topic), msg.Body, msg.MessageId)
 	return result, err
 
-}
-
-func (s *server) handleNetworkError(_ string, info []interface{}) {
-	panic("Implement me.")
-	// clientId := info[0].(HostId)
-	// err := info[1].(error)
-	// if s.leaveFuture != nil {
-	// 	s.Send("shutdown-client", clientId)
-	// 	return
-	// }
-	// if client, found := s.clients[clientId]; found {
-	// 	if client.state == clientStopping || client.state == clientLeaving {
-	// 		return
-	// 	}
-	// 	client.state = clientStopping
-	// 	if err.Error() == "EOF" {
-	// 		Log.Errorf("Peer %s disconnected. Will try to re-connect.", clientId)
-	// 	} else {
-	// 		Log.Errorf("Peer %s: Network error: %v. Will try to re-connect.", clientId, err)
-	// 	}
-
-	// 	s.Send("shutdown-client", client.clientId)
-
-	// 	if clientId > s.hostId {
-	// 		time.AfterFunc(time.Millisecond, func() {
-	// 			s.Send("dial", clientId)
-	// 		})
-	// 	} else {
-	// 		time.AfterFunc(RedialInterval, func() {
-	// 			s.Send("dial", clientId)
-	// 		})
-	// 	}
-	// }
-}
-
-func (s *server) handleLeave(_ string, info []interface{}) {
-	// s.broadcastMessage("", nil, Leaving)
-	// s.listener.Stop()
-	// s.self.Send("shutdown")
-	// time.AfterFunc(timeout, func() { s.leaveFuture.SetValue(false) })
-	// s.leaveFuture.Value()
-	// s.self.Send("stop")
-}
-
-func (s *server) handleSubscribe(_ string, info []interface{}) {
-	// panic("Implement me.")
-	// msg := info[0].(*Message)
-	// replies := info[1].(future.Future)
-	// responses := make([]future.Future, 0, len(s.clients))
-
-	// for _, client := range s.clients {
-	// 	response := future.NewFuture()
-	// 	responses = append(responses, response)
-	// 	client.pendingReplies[msg.MessageId] = response
-	// 	client.writer.Send("write", msg)
-	// }
-	// replies.SetValue(responses)
 }
 
 func (s *server) logf(format string, params ...interface{}) {

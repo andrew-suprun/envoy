@@ -1,8 +1,6 @@
 package common
 
 import (
-	"github.com/andrew-suprun/envoy"
-
 	"log"
 )
 
@@ -22,8 +20,4 @@ func (l defaultLogger) Errorf(format string, v ...interface{}) {
 
 func (l defaultLogger) Panic(err interface{}, stack string) {
 	log.Printf("PANIC: %v\nStack:\n%s", err, stack)
-}
-
-func init() {
-	envoy.Log = &defaultLogger{}
 }

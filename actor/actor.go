@@ -1,8 +1,6 @@
 package actor
 
 import (
-	"fmt"
-	"log"
 	"sync"
 )
 
@@ -31,16 +29,7 @@ type actor struct {
 	*sync.Cond
 }
 
-var actors = make(map[string]int)
-var actorsMutex sync.Mutex
-
 func run(a *actor) {
-	actorsMutex.Lock()
-	typ := fmt.Sprintf("%T", a.handler)
-	actors[typ] = actors[typ] + 1
-	log.Printf("### enter: actors %v", actors)
-	actorsMutex.Unlock()
-
 	for {
 		a.Cond.L.Lock()
 
@@ -57,10 +46,6 @@ func run(a *actor) {
 		a.handler.Handle(msg)
 
 		if _, ok := msg.(MsgStop); ok {
-			actorsMutex.Lock()
-			actors[typ] = actors[typ] - 1
-			log.Printf("### exit: actors %v", actors)
-			actorsMutex.Unlock()
 			return
 		}
 	}

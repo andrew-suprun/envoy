@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/andrew-suprun/envoy/messenger"
+	"github.com/andrew-suprun/envoy/messenger/common"
 	"log"
 	"os"
 	"os/signal"
@@ -117,7 +118,7 @@ func run() {
 	msgr.Leave()
 }
 
-func handler(topic string, body []byte) []byte {
+func handler(topic string, body []byte, msgId common.MessageId) []byte {
 	return body
 }
 

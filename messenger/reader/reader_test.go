@@ -39,8 +39,8 @@ func TestOne(t *testing.T) {
 		MessageType: Publish,
 	})
 	wg.Wait()
-	reader.Stop()
-	writer.Stop()
+	reader.Send(actor.MsgStop{})
+	writer.Send(actor.MsgStop{})
 }
 
 type readHandler struct {

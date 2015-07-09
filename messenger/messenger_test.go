@@ -3,7 +3,7 @@ package messenger
 import (
 	"errors"
 	"fmt"
-	. "github.com/andrew-suprun/envoy"
+	. "github.com/andrew-suprun/envoy/messenger/common"
 	"github.com/andrew-suprun/envoy/messenger/proxy"
 	"log"
 	"sync"
@@ -25,7 +25,11 @@ func TestOneOnOne(t *testing.T) {
 		log.Fatalf("Failed to join: %v", err)
 	}
 	server.Join("localhost:20000")
-	defer server.Leave()
+	defer func() {
+		log.Print("~~~ leaving server")
+		server.Leave()
+		log.Print("~~~ left server")
+	}()
 	server.Subscribe("job", echo)
 
 	client, err := NewMessenger("localhost:40000")
@@ -33,10 +37,15 @@ func TestOneOnOne(t *testing.T) {
 		log.Fatalf("Failed to join: %v", err)
 	}
 	client.Join("localhost:50000")
-	defer client.Leave()
+	defer func() {
+		log.Print("~~~ leaving client")
+		client.Leave()
+		log.Print("~~~ left client")
+	}()
 
 	for i := 0; i < 20; i++ {
 		reply, _, err := client.Request("job", []byte("Hello"))
+		log.Printf("got %s", reply)
 		if err != nil {
 			log.Fatalf("Request returned error: %s", err)
 		}
@@ -47,7 +56,7 @@ func TestOneOnOne(t *testing.T) {
 }
 
 func TestOneOnThree(t *testing.T) {
-	// test()
+	test(proxy.ProxyParams{})
 	log.Println("---------------- TestOneOnThree ----------------")
 
 	Timeout = time.Duration(5 * time.Second)
@@ -211,7 +220,11 @@ func TestDisconnect(t *testing.T) {
 	}
 	server1.Subscribe("job", echo1)
 	server1.Join()
-	defer server1.Leave()
+	defer func() {
+		log.Printf("leaving server1")
+		server1.Leave()
+		log.Printf("left server1")
+	}()
 
 	server2, err := NewMessenger("localhost:50001")
 	if err != nil {
@@ -219,33 +232,33 @@ func TestDisconnect(t *testing.T) {
 	}
 	server2.Subscribe("job", echo2)
 	server2.Join("localhost:50000")
-	defer server2.Leave()
+	defer func() {
+		log.Printf("leaving server2")
+		server2.Leave()
+		log.Printf("left server2")
+	}()
 
 	client1, err := NewMessenger("localhost:40000")
 	if err != nil {
 		log.Fatalf("Failed to join: %v", err)
 	}
 	client1.Join("localhost:50000")
-	defer client1.Leave()
+	defer func() {
+		log.Printf("leaving client1")
+		client1.Leave()
+		log.Printf("left client1")
+	}()
 
 	client2, err := NewMessenger("localhost:40001")
 	if err != nil {
 		log.Fatalf("Failed to join: %v", err)
 	}
 	client2.Join("localhost:50000")
-	defer client2.Leave()
-
-	// TODO
-	// var c int64 = 0
-	// var cc int64
-	// readMessage = func(conn net.Conn) (*message, error) {
-	// 	cc = atomic.AddInt64(&c, 1)
-	// 	if cc%500 == 0 {
-	// 		log.Printf("### closing connection %s:%s [%d] ---", conn.RemoteAddr(), conn.LocalAddr(), cc)
-	// 		conn.Close()
-	// 	}
-	// 	return _readMessage(conn)
-	// }
+	defer func() {
+		log.Printf("leaving client2")
+		client2.Leave()
+		log.Printf("left client2")
+	}()
 
 	c1s1, c1s2, c2s1, c2s2 := 0, 0, 0, 0
 	wg := sync.WaitGroup{}
@@ -305,6 +318,7 @@ func TestDisconnect(t *testing.T) {
 }
 
 func TestPublish(t *testing.T) {
+	test(proxy.ProxyParams{})
 	log.Println("---------------- TestPublish ----------------")
 
 	wg := sync.WaitGroup{}
@@ -333,9 +347,11 @@ func TestPublish(t *testing.T) {
 	})
 	client.Join("localhost:50000")
 	defer client.Leave()
+	log.Print("--> Joined.")
 
 	for i := 0; i < 20; i++ {
 		_, err := client.Publish("job", []byte(fmt.Sprintf("Hello-%d", i)))
+		log.Print("--> Sent message.")
 		if err != nil {
 			log.Fatalf("Request returned error: %s", err)
 		}

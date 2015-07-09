@@ -2,7 +2,6 @@ package reader
 
 import (
 	"bytes"
-	. "github.com/andrew-suprun/envoy"
 	"github.com/andrew-suprun/envoy/actor"
 	. "github.com/andrew-suprun/envoy/messenger/common"
 	"net"

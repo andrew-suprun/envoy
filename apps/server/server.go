@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/andrew-suprun/envoy/messenger"
+	"github.com/andrew-suprun/envoy/messenger/common"
 	"log"
 	"math/rand"
 	"os"
@@ -60,7 +61,7 @@ func main() {
 
 var count int64
 
-func handler(topic string, body []byte) []byte {
+func handler(topic string, body []byte, msgId common.MessageId) []byte {
 	<-workers
 	c := atomic.AddInt64(&count, 1)
 	if c%1000 == 0 {

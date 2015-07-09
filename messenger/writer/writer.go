@@ -3,7 +3,6 @@ package writer
 import (
 	"bytes"
 	"fmt"
-	. "github.com/andrew-suprun/envoy"
 	"github.com/andrew-suprun/envoy/actor"
 	. "github.com/andrew-suprun/envoy/messenger/common"
 	"net"

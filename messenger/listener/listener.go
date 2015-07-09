@@ -2,7 +2,6 @@ package listener
 
 import (
 	"fmt"
-	. "github.com/andrew-suprun/envoy"
 	"github.com/andrew-suprun/envoy/actor"
 	. "github.com/andrew-suprun/envoy/messenger/common"
 	"github.com/andrew-suprun/envoy/messenger/proxy"
